@@ -219,7 +219,6 @@ func (d *ddl) onDropColumn(t *meta.Meta, job *model.Job) error {
 		return ErrCantRemoveAllFields.Gen("can't drop only column %s in table %s",
 			colName, tblInfo.Name)
 	}
-
 	// We don't support dropping column with index covered now.
 	if isColumnWithIndex(colName.L, tblInfo.Indices) {
 		job.State = model.JobCancelled
@@ -294,24 +293,10 @@ func (d *ddl) addTableColumn(t table.Table, columnInfo *model.ColumnInfo, reorgI
 	count := job.GetRowCount()
 	ctx := d.newContext()
 
-	colMeta := &columnMeta{
-		colID:     columnInfo.ID,
-		oldColMap: make(map[int64]*types.FieldType)}
 	handles := make([]int64, 0, defaultBatchCnt)
-	// Get column default value.
-	var err error
-	if columnInfo.DefaultValue != nil {
-		colMeta.defaultVal, err = table.GetColDefaultValue(ctx, columnInfo)
-		if err != nil {
-			job.State = model.JobCancelled
-			log.Errorf("[ddl] fatal: this case shouldn't happen, column %v err %v", columnInfo, err)
-			return errors.Trace(err)
-		}
-	} else if mysql.HasNotNullFlag(columnInfo.Flag) {
-		colMeta.defaultVal = table.GetZeroValue(columnInfo)
-	}
-	for _, col := range t.Meta().Columns {
-		colMeta.oldColMap[col.ID] = &col.FieldType
+	colMeta, err := newColumnMeta(ctx, t, columnInfo, job)
+	if err != nil {
+		return errors.Trace(err)
 	}
 
 	for {
@@ -333,8 +318,8 @@ func (d *ddl) addTableColumn(t table.Table, columnInfo *model.ColumnInfo, reorgI
 
 		count += int64(len(handles))
 		seekHandle = handles[len(handles)-1] + 1
-		sub := time.Since(startTime).Seconds()
 		err = d.backfillColumn(ctx, t, colMeta, handles, reorgInfo)
+		sub := time.Since(startTime).Seconds()
 		if err != nil {
 			log.Warnf("[ddl] added column for %v rows failed, take time %v", count, sub)
 			return errors.Trace(err)
@@ -396,6 +381,31 @@ type columnMeta struct {
 	colID      int64
 	defaultVal types.Datum
 	oldColMap  map[int64]*types.FieldType
+}
+
+func newColumnMeta(ctx context.Context, t table.Table, columnInfo *model.ColumnInfo, job *model.Job) (*columnMeta, error) {
+	colMeta := &columnMeta{
+		colID:     columnInfo.ID,
+		oldColMap: make(map[int64]*types.FieldType, len(t.Meta().Columns)),
+	}
+	for _, col := range t.Meta().Columns {
+		colMeta.oldColMap[col.ID] = &col.FieldType
+	}
+
+	// Get column default value.
+	var err error
+	if columnInfo.DefaultValue != nil {
+		colMeta.defaultVal, err = table.GetColDefaultValue(ctx, columnInfo)
+		if err != nil {
+			job.State = model.JobCancelled
+			log.Errorf("[ddl] fatal: this case shouldn't happen, column %v err %v", columnInfo, err)
+			return nil, errors.Trace(err)
+		}
+	} else if mysql.HasNotNullFlag(columnInfo.Flag) {
+		colMeta.defaultVal = table.GetZeroValue(columnInfo)
+	}
+
+	return colMeta, nil
 }
 
 func (d *ddl) backfillColumn(ctx context.Context, t table.Table, colMeta *columnMeta, handles []int64, reorgInfo *reorgInfo) error {

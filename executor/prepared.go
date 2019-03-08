@@ -14,16 +14,22 @@
 package executor
 
 import (
+	"context"
 	"math"
 	"sort"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser"
+	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/infoschema"
-	"github.com/pingcap/tidb/parser"
-	"github.com/pingcap/tidb/plan"
+	"github.com/pingcap/tidb/planner"
+	plannercore "github.com/pingcap/tidb/planner/core"
+	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	driver "github.com/pingcap/tidb/types/parser_driver"
+	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/sqlexec"
 )
 
@@ -34,7 +40,7 @@ var (
 )
 
 type paramMarkerSorter struct {
-	markers []*ast.ParamMarkerExpr
+	markers []ast.ParamMarkerExpr
 }
 
 func (p *paramMarkerSorter) Len() int {
@@ -42,7 +48,7 @@ func (p *paramMarkerSorter) Len() int {
 }
 
 func (p *paramMarkerSorter) Less(i, j int) bool {
-	return p.markers[i].Offset < p.markers[j].Offset
+	return p.markers[i].(*driver.ParamMarkerExpr).Offset < p.markers[j].(*driver.ParamMarkerExpr).Offset
 }
 
 func (p *paramMarkerSorter) Swap(i, j int) {
@@ -50,7 +56,7 @@ func (p *paramMarkerSorter) Swap(i, j int) {
 }
 
 type paramMarkerExtractor struct {
-	markers []*ast.ParamMarkerExpr
+	markers []ast.ParamMarkerExpr
 }
 
 func (e *paramMarkerExtractor) Enter(in ast.Node) (ast.Node, bool) {
@@ -58,59 +64,45 @@ func (e *paramMarkerExtractor) Enter(in ast.Node) (ast.Node, bool) {
 }
 
 func (e *paramMarkerExtractor) Leave(in ast.Node) (ast.Node, bool) {
-	if x, ok := in.(*ast.ParamMarkerExpr); ok {
+	if x, ok := in.(*driver.ParamMarkerExpr); ok {
 		e.markers = append(e.markers, x)
 	}
 	return in, true
 }
 
-// Prepared represents a prepared statement.
-type Prepared struct {
-	Stmt          ast.StmtNode
-	Params        []*ast.ParamMarkerExpr
-	SchemaVersion int64
-}
-
 // PrepareExec represents a PREPARE executor.
 type PrepareExec struct {
-	IS      infoschema.InfoSchema
-	Ctx     context.Context
-	Name    string
-	SQLText string
+	baseExecutor
+
+	is      infoschema.InfoSchema
+	name    string
+	sqlText string
 
 	ID         uint32
 	ParamCount int
-	Err        error
 	Fields     []*ast.ResultField
 }
 
-// Schema implements the Executor Schema interface.
-func (e *PrepareExec) Schema() *expression.Schema {
-	// Will never be called.
-	return expression.NewSchema()
+// NewPrepareExec creates a new PrepareExec.
+func NewPrepareExec(ctx sessionctx.Context, is infoschema.InfoSchema, sqlTxt string) *PrepareExec {
+	base := newBaseExecutor(ctx, nil, "PrepareStmt")
+	base.initCap = chunk.ZeroCapacity
+	return &PrepareExec{
+		baseExecutor: base,
+		is:           is,
+		sqlText:      sqlTxt,
+	}
 }
 
 // Next implements the Executor Next interface.
-func (e *PrepareExec) Next() (*Row, error) {
-	e.DoPrepare()
-	return nil, e.Err
-}
-
-// Close implements plan.Plan Close interface.
-func (e *PrepareExec) Close() error {
-	return nil
-}
-
-// DoPrepare prepares the statement, it can be called multiple times without
-// side effect.
-func (e *PrepareExec) DoPrepare() {
-	vars := e.Ctx.GetSessionVars()
+func (e *PrepareExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
+	vars := e.ctx.GetSessionVars()
 	if e.ID != 0 {
 		// Must be the case when we retry a prepare.
 		// Make sure it is idempotent.
 		_, ok := vars.PreparedStmts[e.ID]
 		if ok {
-			return
+			return nil
 		}
 	}
 	charset, collation := vars.GetCharsetInfo()
@@ -118,33 +110,43 @@ func (e *PrepareExec) DoPrepare() {
 		stmts []ast.StmtNode
 		err   error
 	)
-	if sqlParser, ok := e.Ctx.(sqlexec.SQLParser); ok {
-		stmts, err = sqlParser.ParseSQL(e.SQLText, charset, collation)
+	if sqlParser, ok := e.ctx.(sqlexec.SQLParser); ok {
+		stmts, err = sqlParser.ParseSQL(e.sqlText, charset, collation)
 	} else {
-		stmts, err = parser.New().Parse(e.SQLText, charset, collation)
+		p := parser.New()
+		p.EnableWindowFunc(vars.EnableWindowFunction)
+		var warns []error
+		stmts, warns, err = p.Parse(e.sqlText, charset, collation)
+		for _, warn := range warns {
+			e.ctx.GetSessionVars().StmtCtx.AppendWarning(util.SyntaxWarn(warn))
+		}
 	}
 	if err != nil {
-		e.Err = errors.Trace(err)
-		return
+		return util.SyntaxError(err)
 	}
 	if len(stmts) != 1 {
-		e.Err = errors.Trace(ErrPrepareMulti)
-		return
+		return ErrPrepareMulti
 	}
 	stmt := stmts[0]
 	if _, ok := stmt.(ast.DDLNode); ok {
-		e.Err = errors.Trace(ErrPrepareDDL)
-		return
+		return ErrPrepareDDL
+	}
+	err = ResetContextOfStmt(e.ctx, stmt)
+	if err != nil {
+		return err
 	}
 	var extractor paramMarkerExtractor
 	stmt.Accept(&extractor)
-	err = plan.Preprocess(stmt, e.IS, e.Ctx)
-	if err != nil {
-		e.Err = errors.Trace(err)
-		return
+
+	// Prepare parameters should NOT over 2 bytes(MaxUint16)
+	// https://dev.mysql.com/doc/internals/en/com-stmt-prepare-response.html#packet-COM_STMT_PREPARE_OK.
+	if len(extractor.markers) > math.MaxUint16 {
+		return ErrPsManyParam
 	}
-	if result, ok := stmt.(ast.ResultSetNode); ok {
-		e.Fields = result.GetResultFields()
+
+	err = plannercore.Preprocess(e.ctx, stmt, e.is, plannercore.InPrepare)
+	if err != nil {
+		return errors.Trace(err)
 	}
 
 	// The parameter markers are appended in visiting order, which may not
@@ -153,160 +155,143 @@ func (e *PrepareExec) DoPrepare() {
 	sorter := &paramMarkerSorter{markers: extractor.markers}
 	sort.Sort(sorter)
 	e.ParamCount = len(sorter.markers)
-	prepared := &Prepared{
+	for i := 0; i < e.ParamCount; i++ {
+		sorter.markers[i].SetOrder(i)
+	}
+	prepared := &ast.Prepared{
 		Stmt:          stmt,
 		Params:        sorter.markers,
-		SchemaVersion: e.IS.SchemaMetaVersion(),
+		SchemaVersion: e.is.SchemaMetaVersion(),
 	}
+	prepared.UseCache = plannercore.PreparedPlanCacheEnabled() && (vars.LightningMode || plannercore.Cacheable(stmt))
 
-	err = plan.PrepareStmt(e.IS, e.Ctx, stmt)
+	// We try to build the real statement of preparedStmt.
+	for i := range prepared.Params {
+		prepared.Params[i].(*driver.ParamMarkerExpr).Datum.SetNull()
+	}
+	var p plannercore.Plan
+	p, err = plannercore.BuildLogicalPlan(e.ctx, stmt, e.is)
 	if err != nil {
-		e.Err = errors.Trace(err)
-		return
+		return errors.Trace(err)
 	}
-
+	if _, ok := stmt.(*ast.SelectStmt); ok {
+		e.Fields = schema2ResultFields(p.Schema(), vars.CurrentDB)
+	}
 	if e.ID == 0 {
 		e.ID = vars.GetNextPreparedStmtID()
 	}
-	if e.Name != "" {
-		vars.PreparedStmtNameToID[e.Name] = e.ID
+	if e.name != "" {
+		vars.PreparedStmtNameToID[e.name] = e.ID
 	}
-	vars.PreparedStmts[e.ID] = prepared
+	return vars.AddPreparedStmt(e.ID, prepared)
 }
 
 // ExecuteExec represents an EXECUTE executor.
 // It cannot be executed by itself, all it needs to do is to build
 // another Executor from a prepared statement.
 type ExecuteExec struct {
-	IS        infoschema.InfoSchema
-	Ctx       context.Context
-	Name      string
-	UsingVars []expression.Expression
-	ID        uint32
-	StmtExec  Executor
-	Stmt      ast.StmtNode
-	Plan      plan.Plan
-}
+	baseExecutor
 
-// Schema implements the Executor Schema interface.
-func (e *ExecuteExec) Schema() *expression.Schema {
-	// Will never be called.
-	return expression.NewSchema()
+	is        infoschema.InfoSchema
+	name      string
+	usingVars []expression.Expression
+	id        uint32
+	stmtExec  Executor
+	stmt      ast.StmtNode
+	plan      plannercore.Plan
 }
 
 // Next implements the Executor Next interface.
-func (e *ExecuteExec) Next() (*Row, error) {
-	// Will never be called.
-	return nil, nil
-}
-
-// Close implements plan.Plan Close interface.
-func (e *ExecuteExec) Close() error {
-	// Will never be called.
+func (e *ExecuteExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
 	return nil
 }
 
 // Build builds a prepared statement into an executor.
 // After Build, e.StmtExec will be used to do the real execution.
 func (e *ExecuteExec) Build() error {
-	vars := e.Ctx.GetSessionVars()
-	if e.Name != "" {
-		e.ID = vars.PreparedStmtNameToID[e.Name]
-	}
-	v := vars.PreparedStmts[e.ID]
-	if v == nil {
-		return errors.Trace(ErrStmtNotFound)
-	}
-	prepared := v.(*Prepared)
-
-	if len(prepared.Params) != len(e.UsingVars) {
-		return errors.Trace(ErrWrongParamCount)
-	}
-
-	for i, usingVar := range e.UsingVars {
-		val, err := usingVar.Eval(nil)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		prepared.Params[i].SetDatum(val)
-	}
-
-	if prepared.SchemaVersion != e.IS.SchemaMetaVersion() {
-		// If the schema version has changed we need to prepare it again,
-		// if this time it failed, the real reason for the error is schema changed.
-		err := plan.PrepareStmt(e.IS, e.Ctx, prepared.Stmt)
-		if err != nil {
-			return ErrSchemaChanged.Gen("Schema change caused error: %s", err.Error())
-		}
-		prepared.SchemaVersion = e.IS.SchemaMetaVersion()
-	}
-	p, err := plan.Optimize(e.Ctx, prepared.Stmt, e.IS)
+	ok, err := IsPointGetWithPKOrUniqueKeyByAutoCommit(e.ctx, e.plan)
 	if err != nil {
 		return errors.Trace(err)
 	}
-	if IsPointGetWithPKOrUniqueKeyByAutoCommit(e.Ctx, p) {
-		err = e.Ctx.InitTxnWithStartTS(math.MaxUint64)
-	} else {
-		err = e.Ctx.ActivePendingTxn()
+	if ok {
+		err = e.ctx.InitTxnWithStartTS(math.MaxUint64)
 	}
 	if err != nil {
 		return errors.Trace(err)
 	}
-	b := newExecutorBuilder(e.Ctx, e.IS)
-	stmtExec := b.build(p)
+	b := newExecutorBuilder(e.ctx, e.is)
+	stmtExec := b.build(e.plan)
 	if b.err != nil {
 		return errors.Trace(b.err)
 	}
-	e.StmtExec = stmtExec
-	e.Stmt = prepared.Stmt
-	e.Plan = p
-	stmtCount(e.Stmt, e.Plan)
+	e.stmtExec = stmtExec
+	CountStmtNode(e.stmt, e.ctx.GetSessionVars().InRestrictedSQL)
+	logExpensiveQuery(e.stmt, e.plan)
 	return nil
 }
 
 // DeallocateExec represent a DEALLOCATE executor.
 type DeallocateExec struct {
-	Name string
-	ctx  context.Context
-}
+	baseExecutor
 
-// Schema implements the Executor Schema interface.
-func (e *DeallocateExec) Schema() *expression.Schema {
-	// Will never be called.
-	return expression.NewSchema()
+	Name string
 }
 
 // Next implements the Executor Next interface.
-func (e *DeallocateExec) Next() (*Row, error) {
+func (e *DeallocateExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
 	vars := e.ctx.GetSessionVars()
 	id, ok := vars.PreparedStmtNameToID[e.Name]
 	if !ok {
-		return nil, errors.Trace(ErrStmtNotFound)
+		return errors.Trace(plannercore.ErrStmtNotFound)
 	}
 	delete(vars.PreparedStmtNameToID, e.Name)
-	delete(vars.PreparedStmts, id)
-	return nil, nil
-}
-
-// Close implements plan.Plan Close interface.
-func (e *DeallocateExec) Close() error {
+	if plannercore.PreparedPlanCacheEnabled() {
+		e.ctx.PreparedPlanCache().Delete(plannercore.NewPSTMTPlanCacheKey(
+			vars, id, vars.PreparedStmts[id].SchemaVersion,
+		))
+	}
+	vars.RemovePreparedStmt(id)
 	return nil
 }
 
 // CompileExecutePreparedStmt compiles a session Execute command to a stmt.Statement.
-func CompileExecutePreparedStmt(ctx context.Context, ID uint32, args ...interface{}) ast.Statement {
-	execPlan := &plan.Execute{ExecID: ID}
-	execPlan.UsingVars = make([]expression.Expression, len(args))
+func CompileExecutePreparedStmt(ctx sessionctx.Context, ID uint32, args ...interface{}) (sqlexec.Statement, error) {
+	execStmt := &ast.ExecuteStmt{ExecID: ID}
+	if err := ResetContextOfStmt(ctx, execStmt); err != nil {
+		return nil, err
+	}
+	execStmt.UsingVars = make([]ast.ExprNode, len(args))
 	for i, val := range args {
-		value := ast.NewValueExpr(val)
-		execPlan.UsingVars[i] = &expression.Constant{Value: value.Datum, RetType: &value.Type}
+		execStmt.UsingVars[i] = ast.NewValueExpr(val)
 	}
-	sa := &statement{
-		is:   GetInfoSchema(ctx),
-		plan: execPlan,
+	is := GetInfoSchema(ctx)
+	execPlan, err := planner.Optimize(ctx, execStmt, is)
+	if err != nil {
+		return nil, errors.Trace(err)
 	}
-	if prepared, ok := ctx.GetSessionVars().PreparedStmts[ID].(*Prepared); ok {
-		sa.text = prepared.Stmt.Text()
+
+	stmt := &ExecStmt{
+		InfoSchema: GetInfoSchema(ctx),
+		Plan:       execPlan,
+		StmtNode:   execStmt,
+		Ctx:        ctx,
 	}
-	return sa
+	if prepared, ok := ctx.GetSessionVars().PreparedStmts[ID]; ok {
+		stmt.Text = prepared.Stmt.Text()
+	}
+	return stmt, nil
+}
+
+func getPreparedStmt(stmt *ast.ExecuteStmt, vars *variable.SessionVars) (ast.StmtNode, error) {
+	var ok bool
+	execID := stmt.ExecID
+	if stmt.Name != "" {
+		if execID, ok = vars.PreparedStmtNameToID[stmt.Name]; !ok {
+			return nil, plannercore.ErrStmtNotFound
+		}
+	}
+	if prepared, ok := vars.PreparedStmts[execID]; ok {
+		return prepared.Stmt, nil
+	}
+	return nil, plannercore.ErrStmtNotFound
 }

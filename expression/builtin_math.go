@@ -18,20 +18,25 @@
 package expression
 
 import (
+	"fmt"
 	"hash/crc32"
 	"math"
 	"math/rand"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/parser/opcode"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/cznic/mathutil"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 var (
 	_ functionClass = &absFunctionClass{}
+	_ functionClass = &roundFunctionClass{}
 	_ functionClass = &ceilFunctionClass{}
 	_ functionClass = &floorFunctionClass{}
 	_ functionClass = &logFunctionClass{}
@@ -39,12 +44,10 @@ var (
 	_ functionClass = &log10FunctionClass{}
 	_ functionClass = &randFunctionClass{}
 	_ functionClass = &powFunctionClass{}
-	_ functionClass = &roundFunctionClass{}
 	_ functionClass = &convFunctionClass{}
 	_ functionClass = &crc32FunctionClass{}
 	_ functionClass = &signFunctionClass{}
 	_ functionClass = &sqrtFunctionClass{}
-	_ functionClass = &arithmeticFunctionClass{}
 	_ functionClass = &acosFunctionClass{}
 	_ functionClass = &asinFunctionClass{}
 	_ functionClass = &atanFunctionClass{}
@@ -60,23 +63,41 @@ var (
 )
 
 var (
-	_ builtinFunc = &builtinAbsSig{}
-	_ builtinFunc = &builtinCeilSig{}
-	_ builtinFunc = &builtinFloorSig{}
-	_ builtinFunc = &builtinLogSig{}
+	_ builtinFunc = &builtinAbsRealSig{}
+	_ builtinFunc = &builtinAbsIntSig{}
+	_ builtinFunc = &builtinAbsUIntSig{}
+	_ builtinFunc = &builtinAbsDecSig{}
+	_ builtinFunc = &builtinRoundRealSig{}
+	_ builtinFunc = &builtinRoundIntSig{}
+	_ builtinFunc = &builtinRoundDecSig{}
+	_ builtinFunc = &builtinRoundWithFracRealSig{}
+	_ builtinFunc = &builtinRoundWithFracIntSig{}
+	_ builtinFunc = &builtinRoundWithFracDecSig{}
+	_ builtinFunc = &builtinCeilRealSig{}
+	_ builtinFunc = &builtinCeilIntToDecSig{}
+	_ builtinFunc = &builtinCeilIntToIntSig{}
+	_ builtinFunc = &builtinCeilDecToIntSig{}
+	_ builtinFunc = &builtinCeilDecToDecSig{}
+	_ builtinFunc = &builtinFloorRealSig{}
+	_ builtinFunc = &builtinFloorIntToDecSig{}
+	_ builtinFunc = &builtinFloorIntToIntSig{}
+	_ builtinFunc = &builtinFloorDecToIntSig{}
+	_ builtinFunc = &builtinFloorDecToDecSig{}
+	_ builtinFunc = &builtinLog1ArgSig{}
+	_ builtinFunc = &builtinLog2ArgsSig{}
 	_ builtinFunc = &builtinLog2Sig{}
 	_ builtinFunc = &builtinLog10Sig{}
 	_ builtinFunc = &builtinRandSig{}
+	_ builtinFunc = &builtinRandWithSeedSig{}
 	_ builtinFunc = &builtinPowSig{}
-	_ builtinFunc = &builtinRoundSig{}
 	_ builtinFunc = &builtinConvSig{}
 	_ builtinFunc = &builtinCRC32Sig{}
 	_ builtinFunc = &builtinSignSig{}
 	_ builtinFunc = &builtinSqrtSig{}
-	_ builtinFunc = &builtinArithmeticSig{}
 	_ builtinFunc = &builtinAcosSig{}
 	_ builtinFunc = &builtinAsinSig{}
-	_ builtinFunc = &builtinAtanSig{}
+	_ builtinFunc = &builtinAtan1ArgSig{}
+	_ builtinFunc = &builtinAtan2ArgsSig{}
 	_ builtinFunc = &builtinCosSig{}
 	_ builtinFunc = &builtinCotSig{}
 	_ builtinFunc = &builtinDegreesSig{}
@@ -85,421 +106,1044 @@ var (
 	_ builtinFunc = &builtinRadiansSig{}
 	_ builtinFunc = &builtinSinSig{}
 	_ builtinFunc = &builtinTanSig{}
-	_ builtinFunc = &builtinTruncateSig{}
+	_ builtinFunc = &builtinTruncateIntSig{}
+	_ builtinFunc = &builtinTruncateRealSig{}
+	_ builtinFunc = &builtinTruncateDecimalSig{}
+	_ builtinFunc = &builtinTruncateUintSig{}
 )
 
 type absFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *absFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinAbsSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *absFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, c.verifyArgs(args)
+	}
+
+	argFieldTp := args[0].GetType()
+	argTp := argFieldTp.EvalType()
+	if argTp != types.ETInt && argTp != types.ETDecimal {
+		argTp = types.ETReal
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, argTp, argTp)
+	if mysql.HasUnsignedFlag(argFieldTp.Flag) {
+		bf.tp.Flag |= mysql.UnsignedFlag
+	}
+	if argTp == types.ETReal {
+		bf.tp.Flen, bf.tp.Decimal = mysql.GetDefaultFieldLengthAndDecimal(mysql.TypeDouble)
+	} else {
+		bf.tp.Flen = argFieldTp.Flen
+		bf.tp.Decimal = argFieldTp.Decimal
+	}
+	var sig builtinFunc
+	switch argTp {
+	case types.ETInt:
+		if mysql.HasUnsignedFlag(argFieldTp.Flag) {
+			sig = &builtinAbsUIntSig{bf}
+			sig.setPbCode(tipb.ScalarFuncSig_AbsUInt)
+		} else {
+			sig = &builtinAbsIntSig{bf}
+			sig.setPbCode(tipb.ScalarFuncSig_AbsInt)
+		}
+	case types.ETDecimal:
+		sig = &builtinAbsDecSig{bf}
+		sig.setPbCode(tipb.ScalarFuncSig_AbsDecimal)
+	case types.ETReal:
+		sig = &builtinAbsRealSig{bf}
+		sig.setPbCode(tipb.ScalarFuncSig_AbsReal)
+	default:
+		panic("unexpected argTp")
+	}
+	return sig, nil
 }
 
-type builtinAbsSig struct {
+type builtinAbsRealSig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_abs
-func (b *builtinAbsSig) eval(row []types.Datum) (types.Datum, error) {
-	args, err := b.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
+func (b *builtinAbsRealSig) Clone() builtinFunc {
+	newSig := &builtinAbsRealSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals ABS(value).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_abs
+func (b *builtinAbsRealSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
 	}
-	d := args[0]
-	switch d.Kind() {
-	case types.KindNull:
-		return d, nil
-	case types.KindUint64:
-		return d, nil
-	case types.KindInt64:
-		iv := d.GetInt64()
-		if iv >= 0 {
-			d.SetInt64(iv)
-			return d, nil
+	return math.Abs(val), false, nil
+}
+
+type builtinAbsIntSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinAbsIntSig) Clone() builtinFunc {
+	newSig := &builtinAbsIntSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals ABS(value).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_abs
+func (b *builtinAbsIntSig) evalInt(row chunk.Row) (int64, bool, error) {
+	val, isNull, err := b.args[0].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	if val >= 0 {
+		return val, false, nil
+	}
+	if val == math.MinInt64 {
+		return 0, false, types.ErrOverflow.GenWithStackByArgs("BIGINT", fmt.Sprintf("abs(%d)", val))
+	}
+	return -val, false, nil
+}
+
+type builtinAbsUIntSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinAbsUIntSig) Clone() builtinFunc {
+	newSig := &builtinAbsUIntSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals ABS(value).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_abs
+func (b *builtinAbsUIntSig) evalInt(row chunk.Row) (int64, bool, error) {
+	return b.args[0].EvalInt(b.ctx, row)
+}
+
+type builtinAbsDecSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinAbsDecSig) Clone() builtinFunc {
+	newSig := &builtinAbsDecSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalDecimal evals ABS(value).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_abs
+func (b *builtinAbsDecSig) evalDecimal(row chunk.Row) (*types.MyDecimal, bool, error) {
+	val, isNull, err := b.args[0].EvalDecimal(b.ctx, row)
+	if isNull || err != nil {
+		return nil, isNull, err
+	}
+	to := new(types.MyDecimal)
+	if !val.IsNegative() {
+		*to = *val
+	} else {
+		if err = types.DecimalSub(new(types.MyDecimal), val, to); err != nil {
+			return nil, true, err
 		}
-		d.SetInt64(-iv)
-		return d, nil
-	default:
-		// we will try to convert other types to float
-		// TODO: if time has no precision, it will be a integer
-		f, err := d.ToFloat64(b.ctx.GetSessionVars().StmtCtx)
-		d.SetFloat64(math.Abs(f))
-		return d, errors.Trace(err)
 	}
+	return to, false, nil
+}
+
+func (c *roundFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, c.verifyArgs(args)
+	}
+	argTp := args[0].GetType().EvalType()
+	if argTp != types.ETInt && argTp != types.ETDecimal {
+		argTp = types.ETReal
+	}
+	argTps := []types.EvalType{argTp}
+	if len(args) > 1 {
+		argTps = append(argTps, types.ETInt)
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, argTp, argTps...)
+	argFieldTp := args[0].GetType()
+	if mysql.HasUnsignedFlag(argFieldTp.Flag) {
+		bf.tp.Flag |= mysql.UnsignedFlag
+	}
+
+	bf.tp.Flen = argFieldTp.Flen
+	bf.tp.Decimal = calculateDecimal4RoundAndTruncate(ctx, args, argTp)
+
+	var sig builtinFunc
+	if len(args) > 1 {
+		switch argTp {
+		case types.ETInt:
+			sig = &builtinRoundWithFracIntSig{bf}
+		case types.ETDecimal:
+			sig = &builtinRoundWithFracDecSig{bf}
+		case types.ETReal:
+			sig = &builtinRoundWithFracRealSig{bf}
+		default:
+			panic("unexpected argTp")
+		}
+	} else {
+		switch argTp {
+		case types.ETInt:
+			sig = &builtinRoundIntSig{bf}
+		case types.ETDecimal:
+			sig = &builtinRoundDecSig{bf}
+		case types.ETReal:
+			sig = &builtinRoundRealSig{bf}
+		default:
+			panic("unexpected argTp")
+		}
+	}
+	return sig, nil
+}
+
+// calculateDecimal4RoundAndTruncate calculates tp.decimals of round/truncate func.
+func calculateDecimal4RoundAndTruncate(ctx sessionctx.Context, args []Expression, retType types.EvalType) int {
+	if retType == types.ETInt || len(args) <= 1 {
+		return 0
+	}
+	secondConst, secondIsConst := args[1].(*Constant)
+	if !secondIsConst {
+		return args[0].GetType().Decimal
+	}
+	argDec, isNull, err := secondConst.EvalInt(ctx, chunk.Row{})
+	if err != nil || isNull || argDec < 0 {
+		return 0
+	}
+	if argDec > mysql.MaxDecimalScale {
+		return mysql.MaxDecimalScale
+	}
+	return int(argDec)
+}
+
+type builtinRoundRealSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinRoundRealSig) Clone() builtinFunc {
+	newSig := &builtinRoundRealSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals ROUND(value).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_round
+func (b *builtinRoundRealSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	return types.Round(val, 0), false, nil
+}
+
+type builtinRoundIntSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinRoundIntSig) Clone() builtinFunc {
+	newSig := &builtinRoundIntSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals ROUND(value).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_round
+func (b *builtinRoundIntSig) evalInt(row chunk.Row) (int64, bool, error) {
+	return b.args[0].EvalInt(b.ctx, row)
+}
+
+type builtinRoundDecSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinRoundDecSig) Clone() builtinFunc {
+	newSig := &builtinRoundDecSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalDecimal evals ROUND(value).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_round
+func (b *builtinRoundDecSig) evalDecimal(row chunk.Row) (*types.MyDecimal, bool, error) {
+	val, isNull, err := b.args[0].EvalDecimal(b.ctx, row)
+	if isNull || err != nil {
+		return nil, isNull, err
+	}
+	to := new(types.MyDecimal)
+	if err = val.Round(to, 0, types.ModeHalfEven); err != nil {
+		return nil, true, err
+	}
+	return to, false, nil
+}
+
+type builtinRoundWithFracRealSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinRoundWithFracRealSig) Clone() builtinFunc {
+	newSig := &builtinRoundWithFracRealSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals ROUND(value, frac).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_round
+func (b *builtinRoundWithFracRealSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	frac, isNull, err := b.args[1].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	return types.Round(val, int(frac)), false, nil
+}
+
+type builtinRoundWithFracIntSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinRoundWithFracIntSig) Clone() builtinFunc {
+	newSig := &builtinRoundWithFracIntSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals ROUND(value, frac).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_round
+func (b *builtinRoundWithFracIntSig) evalInt(row chunk.Row) (int64, bool, error) {
+	val, isNull, err := b.args[0].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	frac, isNull, err := b.args[1].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	return int64(types.Round(float64(val), int(frac))), false, nil
+}
+
+type builtinRoundWithFracDecSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinRoundWithFracDecSig) Clone() builtinFunc {
+	newSig := &builtinRoundWithFracDecSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalDecimal evals ROUND(value, frac).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_round
+func (b *builtinRoundWithFracDecSig) evalDecimal(row chunk.Row) (*types.MyDecimal, bool, error) {
+	val, isNull, err := b.args[0].EvalDecimal(b.ctx, row)
+	if isNull || err != nil {
+		return nil, isNull, err
+	}
+	frac, isNull, err := b.args[1].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return nil, isNull, err
+	}
+	to := new(types.MyDecimal)
+	if err = val.Round(to, mathutil.Min(int(frac), b.tp.Decimal), types.ModeHalfEven); err != nil {
+		return nil, true, err
+	}
+	return to, false, nil
 }
 
 type ceilFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *ceilFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinCeilSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *ceilFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (sig builtinFunc, err error) {
+	if err = c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+
+	retTp, argTp := getEvalTp4FloorAndCeil(args[0])
+	bf := newBaseBuiltinFuncWithTp(ctx, args, retTp, argTp)
+	setFlag4FloorAndCeil(bf.tp, args[0])
+	argFieldTp := args[0].GetType()
+	bf.tp.Flen, bf.tp.Decimal = argFieldTp.Flen, 0
+
+	switch argTp {
+	case types.ETInt:
+		if retTp == types.ETInt {
+			sig = &builtinCeilIntToIntSig{bf}
+			sig.setPbCode(tipb.ScalarFuncSig_CeilIntToInt)
+		} else {
+			sig = &builtinCeilIntToDecSig{bf}
+			sig.setPbCode(tipb.ScalarFuncSig_CeilIntToDec)
+		}
+	case types.ETDecimal:
+		if retTp == types.ETInt {
+			sig = &builtinCeilDecToIntSig{bf}
+			sig.setPbCode(tipb.ScalarFuncSig_CeilDecToInt)
+		} else {
+			sig = &builtinCeilDecToDecSig{bf}
+			sig.setPbCode(tipb.ScalarFuncSig_CeilDecToDec)
+		}
+	default:
+		sig = &builtinCeilRealSig{bf}
+		sig.setPbCode(tipb.ScalarFuncSig_CeilReal)
+	}
+	return sig, nil
 }
 
-type builtinCeilSig struct {
+type builtinCeilRealSig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_ceiling
-func (b *builtinCeilSig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := b.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
+func (b *builtinCeilRealSig) Clone() builtinFunc {
+	newSig := &builtinCeilRealSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinCeilRealSig.
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_ceil
+func (b *builtinCeilRealSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
 	}
-	if args[0].IsNull() ||
-		args[0].Kind() == types.KindUint64 || args[0].Kind() == types.KindInt64 {
-		return args[0], nil
+	return math.Ceil(val), false, nil
+}
+
+type builtinCeilIntToIntSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinCeilIntToIntSig) Clone() builtinFunc {
+	newSig := &builtinCeilIntToIntSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals a builtinCeilIntToIntSig.
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_ceil
+func (b *builtinCeilIntToIntSig) evalInt(row chunk.Row) (int64, bool, error) {
+	return b.args[0].EvalInt(b.ctx, row)
+}
+
+type builtinCeilIntToDecSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinCeilIntToDecSig) Clone() builtinFunc {
+	newSig := &builtinCeilIntToDecSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalDecimal evals a builtinCeilIntToDecSig.
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_Ceil
+func (b *builtinCeilIntToDecSig) evalDecimal(row chunk.Row) (*types.MyDecimal, bool, error) {
+	val, isNull, err := b.args[0].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return nil, true, err
 	}
 
-	f, err := args[0].ToFloat64(b.ctx.GetSessionVars().StmtCtx)
-	if err != nil {
-		return d, errors.Trace(err)
+	if mysql.HasUnsignedFlag(b.args[0].GetType().Flag) || val >= 0 {
+		return types.NewDecFromUint(uint64(val)), false, nil
 	}
-	d.SetFloat64(math.Ceil(f))
-	return
+	return types.NewDecFromInt(val), false, nil
+}
+
+type builtinCeilDecToIntSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinCeilDecToIntSig) Clone() builtinFunc {
+	newSig := &builtinCeilDecToIntSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals a builtinCeilDecToIntSig.
+// Ceil receives
+func (b *builtinCeilDecToIntSig) evalInt(row chunk.Row) (int64, bool, error) {
+	val, isNull, err := b.args[0].EvalDecimal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	// err here will only be ErrOverFlow(will never happen) or ErrTruncate(can be ignored).
+	res, err := val.ToInt()
+	if err == types.ErrTruncated {
+		err = nil
+		if !val.IsNegative() {
+			res = res + 1
+		}
+	}
+	return res, false, err
+}
+
+type builtinCeilDecToDecSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinCeilDecToDecSig) Clone() builtinFunc {
+	newSig := &builtinCeilDecToDecSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalDecimal evals a builtinCeilDecToDecSig.
+func (b *builtinCeilDecToDecSig) evalDecimal(row chunk.Row) (*types.MyDecimal, bool, error) {
+	val, isNull, err := b.args[0].EvalDecimal(b.ctx, row)
+	if isNull || err != nil {
+		return nil, isNull, err
+	}
+
+	res := new(types.MyDecimal)
+	if val.IsNegative() {
+		err = val.Round(res, 0, types.ModeTruncate)
+		return res, err != nil, err
+	}
+
+	err = val.Round(res, 0, types.ModeTruncate)
+	if err != nil || res.Compare(val) == 0 {
+		return res, err != nil, err
+	}
+
+	err = types.DecimalAdd(res, types.NewDecFromInt(1), res)
+	return res, err != nil, err
 }
 
 type floorFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *floorFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinFloorSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+// getEvalTp4FloorAndCeil gets the types.EvalType of FLOOR and CEIL.
+func getEvalTp4FloorAndCeil(arg Expression) (retTp, argTp types.EvalType) {
+	fieldTp := arg.GetType()
+	retTp, argTp = types.ETInt, fieldTp.EvalType()
+	switch argTp {
+	case types.ETInt:
+		if fieldTp.Tp == mysql.TypeLonglong {
+			retTp = types.ETDecimal
+		}
+	case types.ETDecimal:
+		if fieldTp.Flen-fieldTp.Decimal > mysql.MaxIntWidth-2 { // len(math.MaxInt64) - 1
+			retTp = types.ETDecimal
+		}
+	default:
+		retTp, argTp = types.ETReal, types.ETReal
+	}
+	return retTp, argTp
 }
 
-type builtinFloorSig struct {
+// setFlag4FloorAndCeil sets return flag of FLOOR and CEIL.
+func setFlag4FloorAndCeil(tp *types.FieldType, arg Expression) {
+	fieldTp := arg.GetType()
+	if (fieldTp.Tp == mysql.TypeLong || fieldTp.Tp == mysql.TypeNewDecimal) && mysql.HasUnsignedFlag(fieldTp.Flag) {
+		tp.Flag |= mysql.UnsignedFlag
+	}
+	// TODO: when argument type is timestamp, add not null flag.
+}
+
+func (c *floorFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (sig builtinFunc, err error) {
+	if err = c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+
+	retTp, argTp := getEvalTp4FloorAndCeil(args[0])
+	bf := newBaseBuiltinFuncWithTp(ctx, args, retTp, argTp)
+	setFlag4FloorAndCeil(bf.tp, args[0])
+	bf.tp.Flen, bf.tp.Decimal = args[0].GetType().Flen, 0
+	switch argTp {
+	case types.ETInt:
+		if retTp == types.ETInt {
+			sig = &builtinFloorIntToIntSig{bf}
+			sig.setPbCode(tipb.ScalarFuncSig_FloorIntToInt)
+		} else {
+			sig = &builtinFloorIntToDecSig{bf}
+			sig.setPbCode(tipb.ScalarFuncSig_FloorIntToDec)
+		}
+	case types.ETDecimal:
+		if retTp == types.ETInt {
+			sig = &builtinFloorDecToIntSig{bf}
+			sig.setPbCode(tipb.ScalarFuncSig_FloorDecToInt)
+		} else {
+			sig = &builtinFloorDecToDecSig{bf}
+			sig.setPbCode(tipb.ScalarFuncSig_FloorDecToDec)
+		}
+	default:
+		sig = &builtinFloorRealSig{bf}
+		sig.setPbCode(tipb.ScalarFuncSig_FloorReal)
+	}
+	return sig, nil
+}
+
+type builtinFloorRealSig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_floor
-func (b *builtinFloorSig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := b.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
+func (b *builtinFloorRealSig) Clone() builtinFunc {
+	newSig := &builtinFloorRealSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinFloorRealSig.
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_floor
+func (b *builtinFloorRealSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
 	}
-	if args[0].IsNull() ||
-		args[0].Kind() == types.KindUint64 || args[0].Kind() == types.KindInt64 {
-		return args[0], nil
+	return math.Floor(val), false, nil
+}
+
+type builtinFloorIntToIntSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinFloorIntToIntSig) Clone() builtinFunc {
+	newSig := &builtinFloorIntToIntSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals a builtinFloorIntToIntSig.
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_floor
+func (b *builtinFloorIntToIntSig) evalInt(row chunk.Row) (int64, bool, error) {
+	return b.args[0].EvalInt(b.ctx, row)
+}
+
+type builtinFloorIntToDecSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinFloorIntToDecSig) Clone() builtinFunc {
+	newSig := &builtinFloorIntToDecSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalDecimal evals a builtinFloorIntToDecSig.
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_floor
+func (b *builtinFloorIntToDecSig) evalDecimal(row chunk.Row) (*types.MyDecimal, bool, error) {
+	val, isNull, err := b.args[0].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return nil, true, err
 	}
 
-	// have to set IgnoreTruncate to true in order to getValidPrefix
-	sc := b.ctx.GetSessionVars().StmtCtx
-	tmpIT := sc.IgnoreTruncate
-	sc.IgnoreTruncate = true
-	f, err := args[0].ToFloat64(sc)
-	if err != nil {
-		sc.IgnoreTruncate = tmpIT
-		return d, errors.Trace(err)
+	if mysql.HasUnsignedFlag(b.args[0].GetType().Flag) || val >= 0 {
+		return types.NewDecFromUint(uint64(val)), false, nil
+	}
+	return types.NewDecFromInt(val), false, nil
+}
+
+type builtinFloorDecToIntSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinFloorDecToIntSig) Clone() builtinFunc {
+	newSig := &builtinFloorDecToIntSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals a builtinFloorDecToIntSig.
+// floor receives
+func (b *builtinFloorDecToIntSig) evalInt(row chunk.Row) (int64, bool, error) {
+	val, isNull, err := b.args[0].EvalDecimal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	// err here will only be ErrOverFlow(will never happen) or ErrTruncate(can be ignored).
+	res, err := val.ToInt()
+	if err == types.ErrTruncated {
+		err = nil
+		if val.IsNegative() {
+			res--
+		}
+	}
+	return res, false, err
+}
+
+type builtinFloorDecToDecSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinFloorDecToDecSig) Clone() builtinFunc {
+	newSig := &builtinFloorDecToDecSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalDecimal evals a builtinFloorDecToDecSig.
+func (b *builtinFloorDecToDecSig) evalDecimal(row chunk.Row) (*types.MyDecimal, bool, error) {
+	val, isNull, err := b.args[0].EvalDecimal(b.ctx, row)
+	if isNull || err != nil {
+		return nil, true, err
 	}
 
-	sc.IgnoreTruncate = tmpIT
-	d.SetFloat64(math.Floor(f))
-	return
+	res := new(types.MyDecimal)
+	if !val.IsNegative() {
+		err = val.Round(res, 0, types.ModeTruncate)
+		return res, err != nil, err
+	}
+
+	err = val.Round(res, 0, types.ModeTruncate)
+	if err != nil || res.Compare(val) == 0 {
+		return res, err != nil, err
+	}
+
+	err = types.DecimalSub(res, types.NewDecFromInt(1), res)
+	return res, err != nil, err
 }
 
 type logFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *logFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinLogSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *logFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	var (
+		sig     builtinFunc
+		bf      baseBuiltinFunc
+		argsLen = len(args)
+	)
+
+	if argsLen == 1 {
+		bf = newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	} else {
+		bf = newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal, types.ETReal)
+	}
+
+	if argsLen == 1 {
+		sig = &builtinLog1ArgSig{bf}
+	} else {
+		sig = &builtinLog2ArgsSig{bf}
+	}
+
+	return sig, nil
 }
 
-type builtinLogSig struct {
+type builtinLog1ArgSig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_log
-func (b *builtinLogSig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := b.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
+func (b *builtinLog1ArgSig) Clone() builtinFunc {
+	newSig := &builtinLog1ArgSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinLog1ArgSig, corresponding to log(x).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_log
+func (b *builtinLog1ArgSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
 	}
-	sc := b.ctx.GetSessionVars().StmtCtx
-
-	switch len(args) {
-	case 1:
-		x, err := args[0].ToFloat64(sc)
-		if err != nil {
-			return d, errors.Trace(err)
-		}
-
-		if x <= 0 {
-			return d, nil
-		}
-
-		d.SetFloat64(math.Log(x))
-		return d, nil
-	case 2:
-		b, err := args[0].ToFloat64(sc)
-		if err != nil {
-			return d, errors.Trace(err)
-		}
-
-		x, err := args[1].ToFloat64(sc)
-		if err != nil {
-			return d, errors.Trace(err)
-		}
-
-		if b <= 1 || x <= 0 {
-			return d, nil
-		}
-
-		d.SetFloat64(math.Log(x) / math.Log(b))
-		return d, nil
+	if val <= 0 {
+		return 0, true, nil
 	}
-	return
+	return math.Log(val), false, nil
+}
+
+type builtinLog2ArgsSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinLog2ArgsSig) Clone() builtinFunc {
+	newSig := &builtinLog2ArgsSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinLog2ArgsSig, corresponding to log(b, x).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_log
+func (b *builtinLog2ArgsSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val1, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+
+	val2, isNull, err := b.args[1].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+
+	if val1 <= 0 || val1 == 1 || val2 <= 0 {
+		return 0, true, nil
+	}
+
+	return math.Log(val2) / math.Log(val1), false, nil
 }
 
 type log2FunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *log2FunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinLog2Sig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *log2FunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	sig := &builtinLog2Sig{bf}
+	return sig, nil
 }
 
 type builtinLog2Sig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_log2
-func (b *builtinLog2Sig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := b.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
-	}
-	sc := b.ctx.GetSessionVars().StmtCtx
-	x, err := args[0].ToFloat64(sc)
-	if err != nil {
-		return d, errors.Trace(err)
-	}
+func (b *builtinLog2Sig) Clone() builtinFunc {
+	newSig := &builtinLog2Sig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
 
-	if x <= 0 {
-		return
+// evalReal evals a builtinLog2Sig.
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_log2
+func (b *builtinLog2Sig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
 	}
-
-	d.SetFloat64(math.Log2(x))
-	return
+	if val <= 0 {
+		return 0, true, nil
+	}
+	return math.Log2(val), false, nil
 }
 
 type log10FunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *log10FunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinLog10Sig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *log10FunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	sig := &builtinLog10Sig{bf}
+	return sig, nil
 }
 
 type builtinLog10Sig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_log10
-func (b *builtinLog10Sig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := b.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
-	}
-	sc := b.ctx.GetSessionVars().StmtCtx
-	x, err := args[0].ToFloat64(sc)
-	if err != nil {
-		return d, errors.Trace(err)
-	}
+func (b *builtinLog10Sig) Clone() builtinFunc {
+	newSig := &builtinLog10Sig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
 
-	if x <= 0 {
-		return
+// evalReal evals a builtinLog10Sig.
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_log10
+func (b *builtinLog10Sig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
 	}
-
-	d.SetFloat64(math.Log10(x))
-	return
-
+	if val <= 0 {
+		return 0, true, nil
+	}
+	return math.Log10(val), false, nil
 }
 
 type randFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *randFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	err := errors.Trace(c.verifyArgs(args))
-	bt := &builtinRandSig{newBaseBuiltinFunc(args, ctx)}
-	bt.deterministic = false
-	return bt, errors.Trace(err)
+func (c *randFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	var sig builtinFunc
+	var argTps []types.EvalType
+	if len(args) > 0 {
+		argTps = []types.EvalType{types.ETInt}
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, argTps...)
+	bt := bf
+	if len(args) == 0 {
+		seed := time.Now().UnixNano()
+		sig = &builtinRandSig{bt, rand.New(rand.NewSource(seed))}
+	} else if _, isConstant := args[0].(*Constant); isConstant {
+		// According to MySQL manual:
+		// If an integer argument N is specified, it is used as the seed value:
+		// With a constant initializer argument, the seed is initialized once
+		// when the statement is prepared, prior to execution.
+		seed, isNull, err := args[0].EvalInt(ctx, chunk.Row{})
+		if err != nil {
+			return nil, err
+		}
+		if isNull {
+			seed = time.Now().UnixNano()
+		}
+		sig = &builtinRandSig{bt, rand.New(rand.NewSource(seed))}
+	} else {
+		sig = &builtinRandWithSeedSig{bt}
+	}
+	return sig, nil
 }
 
 type builtinRandSig struct {
 	baseBuiltinFunc
+	randGen *rand.Rand
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_rand
-func (b *builtinRandSig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := b.evalArgs(row)
+func (b *builtinRandSig) Clone() builtinFunc {
+	newSig := &builtinRandSig{randGen: b.randGen}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals RAND().
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_rand
+func (b *builtinRandSig) evalReal(row chunk.Row) (float64, bool, error) {
+	return b.randGen.Float64(), false, nil
+}
+
+type builtinRandWithSeedSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinRandWithSeedSig) Clone() builtinFunc {
+	newSig := &builtinRandWithSeedSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals RAND(N).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_rand
+func (b *builtinRandWithSeedSig) evalReal(row chunk.Row) (float64, bool, error) {
+	seed, isNull, err := b.args[0].EvalInt(b.ctx, row)
 	if err != nil {
-		return types.Datum{}, errors.Trace(err)
+		return 0, true, err
 	}
-	if len(args) == 1 && !args[0].IsNull() {
-		seed, err := args[0].ToInt64(b.ctx.GetSessionVars().StmtCtx)
-		if err != nil {
-			return d, errors.Trace(err)
-		}
-		rand.Seed(seed)
+	// b.args[0] is promised to be a non-constant(such as a column name) in
+	// builtinRandWithSeedSig, the seed is initialized with the value for each
+	// invocation of RAND().
+	var randGen *rand.Rand
+	if isNull {
+		randGen = rand.New(rand.NewSource(time.Now().UnixNano()))
+	} else {
+		randGen = rand.New(rand.NewSource(seed))
 	}
-	d.SetFloat64(rand.Float64())
-	return d, nil
+	return randGen.Float64(), false, nil
 }
 
 type powFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *powFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinPowSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *powFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal, types.ETReal)
+	sig := &builtinPowSig{bf}
+	return sig, nil
 }
 
 type builtinPowSig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_pow
-func (b *builtinPowSig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := b.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
-	}
-	sc := b.ctx.GetSessionVars().StmtCtx
-	x, err := args[0].ToFloat64(sc)
-	if err != nil {
-		return d, errors.Trace(err)
-	}
+func (b *builtinPowSig) Clone() builtinFunc {
+	newSig := &builtinPowSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
 
-	y, err := args[1].ToFloat64(sc)
-	if err != nil {
-		return d, errors.Trace(err)
+// evalReal evals POW(x, y).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_pow
+func (b *builtinPowSig) evalReal(row chunk.Row) (float64, bool, error) {
+	x, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
 	}
-	d.SetFloat64(math.Pow(x, y))
-	return d, nil
+	y, isNull, err := b.args[1].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	power := math.Pow(x, y)
+	if math.IsInf(power, -1) || math.IsInf(power, 1) || math.IsNaN(power) {
+		return 0, false, types.ErrOverflow.GenWithStackByArgs("DOUBLE", fmt.Sprintf("pow(%s, %s)", strconv.FormatFloat(x, 'f', -1, 64), strconv.FormatFloat(y, 'f', -1, 64)))
+	}
+	return power, false, nil
 }
 
 type roundFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *roundFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinRoundSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
-}
-
-type builtinRoundSig struct {
-	baseBuiltinFunc
-}
-
-// See http://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_round
-func (b *builtinRoundSig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := b.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
-	}
-	if args[0].IsNull() {
-		return
-	}
-	sc := b.ctx.GetSessionVars().StmtCtx
-
-	frac := 0
-	if len(args) == 2 {
-		frac64, err1 := args[1].ToInt64(sc)
-		if err1 != nil {
-			return d, errors.Trace(err1)
-		}
-		frac = int(frac64)
-	}
-
-	if args[0].Kind() == types.KindMysqlDecimal {
-		var dec types.MyDecimal
-		err = args[0].GetMysqlDecimal().Round(&dec, frac)
-		if err != nil {
-			return d, errors.Trace(err)
-		}
-		d.SetMysqlDecimal(&dec)
-		return d, nil
-	}
-
-	x, err := args[0].ToFloat64(sc)
-	if err != nil {
-		return d, errors.Trace(err)
-	}
-
-	val := types.Round(x, frac)
-	switch args[0].Kind() {
-	case types.KindInt64:
-		d.SetInt64(int64(val))
-	case types.KindUint64:
-		d.SetUint64(uint64(val))
-	default:
-		d.SetFloat64(val)
-		if frac > 0 {
-			d.SetFrac(frac)
-		}
-	}
-	return d, nil
-}
-
 type convFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *convFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinConvSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *convFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETString, types.ETString, types.ETInt, types.ETInt)
+	bf.tp.Flen = 64
+	sig := &builtinConvSig{bf}
+	return sig, nil
 }
 
 type builtinConvSig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_conv
-func (b *builtinConvSig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := b.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
+func (b *builtinConvSig) Clone() builtinFunc {
+	newSig := &builtinConvSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalString evals CONV(N,from_base,to_base).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_conv.
+func (b *builtinConvSig) evalString(row chunk.Row) (res string, isNull bool, err error) {
+	n, isNull, err := b.args[0].EvalString(b.ctx, row)
+	if isNull || err != nil {
+		return res, isNull, err
 	}
+
+	fromBase, isNull, err := b.args[1].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return res, isNull, err
+	}
+
+	toBase, isNull, err := b.args[2].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return res, isNull, err
+	}
+
 	var (
 		signed     bool
 		negative   bool
 		ignoreSign bool
 	)
-	for _, arg := range args {
-		if arg.IsNull() {
-			return d, nil
-		}
-	}
-	n, err := args[0].ToString()
-	if err != nil {
-		return d, errors.Trace(err)
-	}
-	sc := b.ctx.GetSessionVars().StmtCtx
-	fromBase, err := args[1].ToInt64(sc)
-	if err != nil {
-		return d, errors.Trace(err)
-	}
-	toBase, err := args[2].ToInt64(sc)
-	if err != nil {
-		return d, errors.Trace(err)
-	}
-
 	if fromBase < 0 {
 		fromBase = -fromBase
 		signed = true
 	}
+
 	if toBase < 0 {
-		ignoreSign = true
 		toBase = -toBase
+		ignoreSign = true
 	}
+
 	if fromBase > 36 || fromBase < 2 || toBase > 36 || toBase < 2 {
-		return d, nil
+		return res, true, nil
 	}
+
 	n = getValidPrefix(strings.TrimSpace(n), fromBase)
 	if len(n) == 0 {
-		return d, nil
+		return "0", false, nil
 	}
+
 	if n[0] == '-' {
 		negative = true
 		n = n[1:]
@@ -507,9 +1151,8 @@ func (b *builtinConvSig) eval(row []types.Datum) (d types.Datum, err error) {
 
 	val, err := strconv.ParseUint(n, int(fromBase), 64)
 	if err != nil {
-		return d, errors.Trace(types.ErrOverflow)
+		return res, false, types.ErrOverflow.GenWithStackByArgs("BIGINT UNSINGED", n)
 	}
-	// See https://github.com/mysql/mysql-server/blob/5.7/strings/ctype-simple.c#L598
 	if signed {
 		if negative && val > -math.MinInt64 {
 			val = -math.MinInt64
@@ -521,7 +1164,7 @@ func (b *builtinConvSig) eval(row []types.Datum) (d types.Datum, err error) {
 	if negative {
 		val = -val
 	}
-	// See https://github.com/mysql/mysql-server/blob/5.7/strings/longlong2str.c#L58
+
 	if int64(val) < 0 {
 		negative = true
 	} else {
@@ -535,365 +1178,702 @@ func (b *builtinConvSig) eval(row []types.Datum) (d types.Datum, err error) {
 	if negative && ignoreSign {
 		s = "-" + s
 	}
-	d.SetString(strings.ToUpper(s))
-	return d, nil
+	res = strings.ToUpper(s)
+	return res, false, nil
 }
 
 type crc32FunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *crc32FunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinCRC32Sig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *crc32FunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETInt, types.ETString)
+	bf.tp.Flen = 10
+	bf.tp.Flag |= mysql.UnsignedFlag
+	sig := &builtinCRC32Sig{bf}
+	return sig, nil
 }
 
 type builtinCRC32Sig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_crc32
-func (b *builtinCRC32Sig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := b.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
-	}
-	if args[0].IsNull() {
-		return d, nil
-	}
-	x, err := args[0].ToString()
-	if err != nil {
-		return d, errors.Trace(err)
+func (b *builtinCRC32Sig) Clone() builtinFunc {
+	newSig := &builtinCRC32Sig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals a CRC32(expr).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_crc32
+func (b *builtinCRC32Sig) evalInt(row chunk.Row) (int64, bool, error) {
+	x, isNull, err := b.args[0].EvalString(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
 	}
 	r := crc32.ChecksumIEEE([]byte(x))
-	d.SetUint64(uint64(r))
-	return d, nil
+	return int64(r), false, nil
 }
 
 type signFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *signFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinSignSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *signFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETInt, types.ETReal)
+	sig := &builtinSignSig{bf}
+	return sig, nil
 }
 
 type builtinSignSig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_sign
-func (b *builtinSignSig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := b.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
+func (b *builtinSignSig) Clone() builtinFunc {
+	newSig := &builtinSignSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals SIGN(v).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_sign
+func (b *builtinSignSig) evalInt(row chunk.Row) (int64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
 	}
-	if args[0].IsNull() {
-		return d, nil
+	if val > 0 {
+		return 1, false, nil
+	} else if val == 0 {
+		return 0, false, nil
+	} else {
+		return -1, false, nil
 	}
-	cmp, err := args[0].CompareDatum(b.ctx.GetSessionVars().StmtCtx, types.NewIntDatum(0))
-	d.SetInt64(int64(cmp))
-	if err != nil {
-		return d, errors.Trace(err)
-	}
-	return d, nil
 }
 
 type sqrtFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *sqrtFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinSqrtSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *sqrtFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	sig := &builtinSqrtSig{bf}
+	return sig, nil
 }
 
 type builtinSqrtSig struct {
 	baseBuiltinFunc
 }
 
-// See http://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_sqrt
-func (b *builtinSqrtSig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := b.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
-	}
-	if args[0].IsNull() {
-		return args[0], nil
-	}
-
-	sc := b.ctx.GetSessionVars().StmtCtx
-	f, err := args[0].ToFloat64(sc)
-	if err != nil {
-		return d, errors.Trace(err)
-	}
-
-	// negative value does not have any square root in rational number
-	// Need return null directly.
-	if f < 0 {
-		d.SetNull()
-		return d, nil
-	}
-
-	d.SetFloat64(math.Sqrt(f))
-	return
+func (b *builtinSqrtSig) Clone() builtinFunc {
+	newSig := &builtinSqrtSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
 }
 
-type arithmeticFunctionClass struct {
-	baseFunctionClass
-
-	op opcode.Op
-}
-
-func (c *arithmeticFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinArithmeticSig{newBaseBuiltinFunc(args, ctx), c.op}, errors.Trace(c.verifyArgs(args))
-}
-
-type builtinArithmeticSig struct {
-	baseBuiltinFunc
-
-	op opcode.Op
-}
-
-func (s *builtinArithmeticSig) eval(row []types.Datum) (d types.Datum, err error) {
-	args, err := s.evalArgs(row)
-	if err != nil {
-		return types.Datum{}, errors.Trace(err)
+// evalReal evals a SQRT(x).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_sqrt
+func (b *builtinSqrtSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
 	}
-	sc := s.ctx.GetSessionVars().StmtCtx
-	a, err := types.CoerceArithmetic(sc, args[0])
-	if err != nil {
-		return d, errors.Trace(err)
+	if val < 0 {
+		return 0, true, nil
 	}
-
-	b, err := types.CoerceArithmetic(sc, args[1])
-	if err != nil {
-		return d, errors.Trace(err)
-	}
-	a, b, err = types.CoerceDatum(sc, a, b)
-	if err != nil {
-		return d, errors.Trace(err)
-	}
-	if a.IsNull() || b.IsNull() {
-		return
-	}
-
-	switch s.op {
-	case opcode.Plus:
-		return types.ComputePlus(a, b)
-	case opcode.Minus:
-		return types.ComputeMinus(a, b)
-	case opcode.Mul:
-		return types.ComputeMul(a, b)
-	case opcode.Div:
-		return types.ComputeDiv(sc, a, b)
-	case opcode.Mod:
-		return types.ComputeMod(sc, a, b)
-	case opcode.IntDiv:
-		return types.ComputeIntDiv(sc, a, b)
-	default:
-		return d, errInvalidOperation.Gen("invalid op %v in arithmetic operation", s.op)
-	}
+	return math.Sqrt(val), false, nil
 }
 
 type acosFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *acosFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinAcosSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *acosFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	sig := &builtinAcosSig{bf}
+	return sig, nil
 }
 
 type builtinAcosSig struct {
 	baseBuiltinFunc
 }
 
+func (b *builtinAcosSig) Clone() builtinFunc {
+	newSig := &builtinAcosSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinAcosSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_acos
-func (b *builtinAcosSig) eval(row []types.Datum) (d types.Datum, err error) {
-	return d, errFunctionNotExists.GenByArgs("acos")
+func (b *builtinAcosSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	if val < -1 || val > 1 {
+		return 0, true, nil
+	}
+
+	return math.Acos(val), false, nil
 }
 
 type asinFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *asinFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinAsinSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *asinFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	sig := &builtinAsinSig{bf}
+	return sig, nil
 }
 
 type builtinAsinSig struct {
 	baseBuiltinFunc
 }
 
+func (b *builtinAsinSig) Clone() builtinFunc {
+	newSig := &builtinAsinSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinAsinSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_asin
-func (b *builtinAsinSig) eval(row []types.Datum) (d types.Datum, err error) {
-	return d, errFunctionNotExists.GenByArgs("asin")
+func (b *builtinAsinSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+
+	if val < -1 || val > 1 {
+		return 0, true, nil
+	}
+
+	return math.Asin(val), false, nil
 }
 
 type atanFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *atanFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinAtanSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *atanFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	var (
+		sig     builtinFunc
+		bf      baseBuiltinFunc
+		argsLen = len(args)
+	)
+
+	if argsLen == 1 {
+		bf = newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	} else {
+		bf = newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal, types.ETReal)
+	}
+
+	if argsLen == 1 {
+		sig = &builtinAtan1ArgSig{bf}
+	} else {
+		sig = &builtinAtan2ArgsSig{bf}
+	}
+
+	return sig, nil
 }
 
-type builtinAtanSig struct {
+type builtinAtan1ArgSig struct {
 	baseBuiltinFunc
 }
 
+func (b *builtinAtan1ArgSig) Clone() builtinFunc {
+	newSig := &builtinAtan1ArgSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinAtan1ArgSig, corresponding to atan(x).
 // See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_atan
-func (b *builtinAtanSig) eval(row []types.Datum) (d types.Datum, err error) {
-	return d, errFunctionNotExists.GenByArgs("atan")
+func (b *builtinAtan1ArgSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+
+	return math.Atan(val), false, nil
+}
+
+type builtinAtan2ArgsSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinAtan2ArgsSig) Clone() builtinFunc {
+	newSig := &builtinAtan2ArgsSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinAtan1ArgSig, corresponding to atan(y, x).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_atan
+func (b *builtinAtan2ArgsSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val1, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+
+	val2, isNull, err := b.args[1].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+
+	return math.Atan2(val1, val2), false, nil
 }
 
 type cosFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *cosFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinCosSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *cosFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	sig := &builtinCosSig{bf}
+	return sig, nil
 }
 
 type builtinCosSig struct {
 	baseBuiltinFunc
 }
 
+func (b *builtinCosSig) Clone() builtinFunc {
+	newSig := &builtinCosSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinCosSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_cos
-func (b *builtinCosSig) eval(row []types.Datum) (d types.Datum, err error) {
-	return d, errFunctionNotExists.GenByArgs("cos")
+func (b *builtinCosSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	return math.Cos(val), false, nil
 }
 
 type cotFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *cotFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinCotSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *cotFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	sig := &builtinCotSig{bf}
+	return sig, nil
 }
 
 type builtinCotSig struct {
 	baseBuiltinFunc
 }
 
+func (b *builtinCotSig) Clone() builtinFunc {
+	newSig := &builtinCotSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinCotSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_cot
-func (b *builtinCotSig) eval(row []types.Datum) (d types.Datum, err error) {
-	return d, errFunctionNotExists.GenByArgs("cot")
+func (b *builtinCotSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+
+	tan := math.Tan(val)
+	if tan != 0 {
+		cot := 1 / tan
+		if !math.IsInf(cot, 0) && !math.IsNaN(cot) {
+			return cot, false, nil
+		}
+	}
+	return 0, false, types.ErrOverflow.GenWithStackByArgs("DOUBLE", fmt.Sprintf("cot(%s)", strconv.FormatFloat(val, 'f', -1, 64)))
 }
 
 type degreesFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *degreesFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinDegreesSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *degreesFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	sig := &builtinDegreesSig{bf}
+	return sig, nil
 }
 
 type builtinDegreesSig struct {
 	baseBuiltinFunc
 }
 
+func (b *builtinDegreesSig) Clone() builtinFunc {
+	newSig := &builtinDegreesSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinDegreesSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_degrees
-func (b *builtinDegreesSig) eval(row []types.Datum) (d types.Datum, err error) {
-	return d, errFunctionNotExists.GenByArgs("degrees")
+func (b *builtinDegreesSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	res := val * 180 / math.Pi
+	return res, false, nil
 }
 
 type expFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *expFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinExpSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *expFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	sig := &builtinExpSig{bf}
+	return sig, nil
 }
 
 type builtinExpSig struct {
 	baseBuiltinFunc
 }
 
+func (b *builtinExpSig) Clone() builtinFunc {
+	newSig := &builtinExpSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinExpSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_exp
-func (b *builtinExpSig) eval(row []types.Datum) (d types.Datum, err error) {
-	return d, errFunctionNotExists.GenByArgs("exp")
+func (b *builtinExpSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	exp := math.Exp(val)
+	if math.IsInf(exp, 0) || math.IsNaN(exp) {
+		s := fmt.Sprintf("exp(%s)", strconv.FormatFloat(val, 'f', -1, 64))
+		return 0, false, types.ErrOverflow.GenWithStackByArgs("DOUBLE", s)
+	}
+	return exp, false, nil
 }
 
 type piFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *piFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinPISig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *piFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	var (
+		bf  baseBuiltinFunc
+		sig builtinFunc
+	)
+
+	bf = newBaseBuiltinFuncWithTp(ctx, args, types.ETReal)
+	bf.tp.Decimal = 6
+	bf.tp.Flen = 8
+	sig = &builtinPISig{bf}
+	return sig, nil
 }
 
 type builtinPISig struct {
 	baseBuiltinFunc
 }
 
+func (b *builtinPISig) Clone() builtinFunc {
+	newSig := &builtinPISig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinPISig.
 // See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_pi
-func (b *builtinPISig) eval(row []types.Datum) (d types.Datum, err error) {
-	return d, errFunctionNotExists.GenByArgs("pi")
+func (b *builtinPISig) evalReal(_ chunk.Row) (float64, bool, error) {
+	return float64(math.Pi), false, nil
 }
 
 type radiansFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *radiansFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinRadiansSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *radiansFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	sig := &builtinRadiansSig{bf}
+	return sig, nil
 }
 
 type builtinRadiansSig struct {
 	baseBuiltinFunc
 }
 
+func (b *builtinRadiansSig) Clone() builtinFunc {
+	newSig := &builtinRadiansSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals RADIANS(X).
 // See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_radians
-func (b *builtinRadiansSig) eval(row []types.Datum) (d types.Datum, err error) {
-	return d, errFunctionNotExists.GenByArgs("radians")
+func (b *builtinRadiansSig) evalReal(row chunk.Row) (float64, bool, error) {
+	x, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	return x * math.Pi / 180, false, nil
 }
 
 type sinFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *sinFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinSinSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *sinFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	sig := &builtinSinSig{bf}
+	return sig, nil
 }
 
 type builtinSinSig struct {
 	baseBuiltinFunc
 }
 
+func (b *builtinSinSig) Clone() builtinFunc {
+	newSig := &builtinSinSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinSinSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_sin
-func (b *builtinSinSig) eval(row []types.Datum) (d types.Datum, err error) {
-	return d, errFunctionNotExists.GenByArgs("sin")
+func (b *builtinSinSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	return math.Sin(val), false, nil
 }
 
 type tanFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *tanFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinTanSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *tanFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+	bf := newBaseBuiltinFuncWithTp(ctx, args, types.ETReal, types.ETReal)
+	sig := &builtinTanSig{bf}
+	return sig, nil
 }
 
 type builtinTanSig struct {
 	baseBuiltinFunc
 }
 
+func (b *builtinTanSig) Clone() builtinFunc {
+	newSig := &builtinTanSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a builtinTanSig.
 // See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_tan
-func (b *builtinTanSig) eval(row []types.Datum) (d types.Datum, err error) {
-	return d, errFunctionNotExists.GenByArgs("tan")
+func (b *builtinTanSig) evalReal(row chunk.Row) (float64, bool, error) {
+	val, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	return math.Tan(val), false, nil
 }
 
 type truncateFunctionClass struct {
 	baseFunctionClass
 }
 
-func (c *truncateFunctionClass) getFunction(args []Expression, ctx context.Context) (builtinFunc, error) {
-	return &builtinTruncateSig{newBaseBuiltinFunc(args, ctx)}, errors.Trace(c.verifyArgs(args))
+func (c *truncateFunctionClass) getFunction(ctx sessionctx.Context, args []Expression) (builtinFunc, error) {
+	if err := c.verifyArgs(args); err != nil {
+		return nil, err
+	}
+
+	argTp := args[0].GetType().EvalType()
+	if argTp == types.ETTimestamp || argTp == types.ETDatetime || argTp == types.ETDuration || argTp == types.ETString {
+		argTp = types.ETReal
+	}
+
+	bf := newBaseBuiltinFuncWithTp(ctx, args, argTp, argTp, types.ETInt)
+
+	bf.tp.Decimal = calculateDecimal4RoundAndTruncate(ctx, args, argTp)
+	bf.tp.Flen = args[0].GetType().Flen - args[0].GetType().Decimal + bf.tp.Decimal
+	bf.tp.Flag |= args[0].GetType().Flag
+
+	var sig builtinFunc
+	switch argTp {
+	case types.ETInt:
+		if mysql.HasUnsignedFlag(args[0].GetType().Flag) {
+			sig = &builtinTruncateUintSig{bf}
+		} else {
+			sig = &builtinTruncateIntSig{bf}
+		}
+	case types.ETReal:
+		sig = &builtinTruncateRealSig{bf}
+	case types.ETDecimal:
+		sig = &builtinTruncateDecimalSig{bf}
+	}
+
+	return sig, nil
 }
 
-type builtinTruncateSig struct {
+type builtinTruncateDecimalSig struct {
 	baseBuiltinFunc
 }
 
+func (b *builtinTruncateDecimalSig) Clone() builtinFunc {
+	newSig := &builtinTruncateDecimalSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalDecimal evals a TRUNCATE(X,D).
 // See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_truncate
-func (b *builtinTruncateSig) eval(row []types.Datum) (d types.Datum, err error) {
-	return d, errFunctionNotExists.GenByArgs("truncate")
+func (b *builtinTruncateDecimalSig) evalDecimal(row chunk.Row) (*types.MyDecimal, bool, error) {
+	x, isNull, err := b.args[0].EvalDecimal(b.ctx, row)
+	if isNull || err != nil {
+		return nil, isNull, err
+	}
+
+	d, isNull, err := b.args[1].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return nil, isNull, err
+	}
+
+	result := new(types.MyDecimal)
+	if err := x.Round(result, mathutil.Min(int(d), b.getRetTp().Decimal), types.ModeTruncate); err != nil {
+		return nil, true, err
+	}
+	return result, false, nil
+}
+
+type builtinTruncateRealSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinTruncateRealSig) Clone() builtinFunc {
+	newSig := &builtinTruncateRealSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalReal evals a TRUNCATE(X,D).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_truncate
+func (b *builtinTruncateRealSig) evalReal(row chunk.Row) (float64, bool, error) {
+	x, isNull, err := b.args[0].EvalReal(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+
+	d, isNull, err := b.args[1].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+
+	return types.Truncate(x, int(d)), false, nil
+}
+
+type builtinTruncateIntSig struct {
+	baseBuiltinFunc
+}
+
+func (b *builtinTruncateIntSig) Clone() builtinFunc {
+	newSig := &builtinTruncateIntSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+// evalInt evals a TRUNCATE(X,D).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_truncate
+func (b *builtinTruncateIntSig) evalInt(row chunk.Row) (int64, bool, error) {
+	x, isNull, err := b.args[0].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+
+	d, isNull, err := b.args[1].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+
+	if d >= 0 {
+		return x, false, nil
+	}
+	shift := int64(math.Pow10(int(-d)))
+	return x / shift * shift, false, nil
+}
+
+func (b *builtinTruncateUintSig) Clone() builtinFunc {
+	newSig := &builtinTruncateUintSig{}
+	newSig.cloneFrom(&b.baseBuiltinFunc)
+	return newSig
+}
+
+type builtinTruncateUintSig struct {
+	baseBuiltinFunc
+}
+
+// evalInt evals a TRUNCATE(X,D).
+// See https://dev.mysql.com/doc/refman/5.7/en/mathematical-functions.html#function_truncate
+func (b *builtinTruncateUintSig) evalInt(row chunk.Row) (int64, bool, error) {
+	x, isNull, err := b.args[0].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	uintx := uint64(x)
+
+	d, isNull, err := b.args[1].EvalInt(b.ctx, row)
+	if isNull || err != nil {
+		return 0, isNull, err
+	}
+	if d >= 0 {
+		return x, false, nil
+	}
+	shift := uint64(math.Pow10(int(-d)))
+	return int64(uintx / shift * shift), false, nil
 }

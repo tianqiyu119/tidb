@@ -14,24 +14,29 @@
 package ddl
 
 import (
+	"context"
 	"time"
 
-	"github.com/juju/errors"
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/mock"
-	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pingcap/tidb/util/types"
 )
 
 var _ = Suite(&testSchemaSuite{})
 
 type testSchemaSuite struct{}
+
+func (s *testSchemaSuite) SetUpSuite(c *C) {
+}
+
+func (s *testSchemaSuite) TearDownSuite(c *C) {
+}
 
 func testSchemaInfo(c *C, d *ddl, name string) *model.DBInfo {
 	var err error
@@ -44,7 +49,7 @@ func testSchemaInfo(c *C, d *ddl, name string) *model.DBInfo {
 	return dbInfo
 }
 
-func testCreateSchema(c *C, ctx context.Context, d *ddl, dbInfo *model.DBInfo) *model.Job {
+func testCreateSchema(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo) *model.Job {
 	job := &model.Job{
 		SchemaID:   dbInfo.ID,
 		Type:       model.ActionCreateSchema,
@@ -61,23 +66,26 @@ func testCreateSchema(c *C, ctx context.Context, d *ddl, dbInfo *model.DBInfo) *
 	return job
 }
 
-func testDropSchema(c *C, ctx context.Context, d *ddl, dbInfo *model.DBInfo) (*model.Job, int64) {
-	job := &model.Job{
+func buildDropSchemaJob(dbInfo *model.DBInfo) *model.Job {
+	return &model.Job{
 		SchemaID:   dbInfo.ID,
 		Type:       model.ActionDropSchema,
 		BinlogInfo: &model.HistoryInfo{},
 	}
+}
+
+func testDropSchema(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo) (*model.Job, int64) {
+	job := buildDropSchemaJob(dbInfo)
 	err := d.doDDLJob(ctx, job)
 	c.Assert(err, IsNil)
-
 	ver := getSchemaVer(c, ctx)
 	return job, ver
 }
 
 func isDDLJobDone(c *C, t *meta.Meta) bool {
-	bgJob, err := t.GetBgJob(0)
+	job, err := t.GetDDLJobByIdx(0)
 	c.Assert(err, IsNil)
-	if bgJob == nil {
+	if job == nil {
 		return true
 	}
 
@@ -115,10 +123,9 @@ func testCheckSchemaState(c *C, d *ddl, dbInfo *model.DBInfo, state model.Schema
 }
 
 func (s *testSchemaSuite) TestSchema(c *C) {
-	defer testleak.AfterTest(c)()
 	store := testCreateStore(c, "test_schema")
 	defer store.Close()
-	d := newDDL(store, nil, nil, testLease)
+	d := testNewDDL(context.Background(), nil, store, nil, nil, testLease)
 	defer d.Stop()
 	ctx := testNewContext(d)
 	dbInfo := testSchemaInfo(c, d, "test")
@@ -139,46 +146,22 @@ func (s *testSchemaSuite) TestSchema(c *C) {
 		_, err := tbl1.AddRecord(ctx, types.MakeDatums(i, i, i))
 		c.Assert(err, IsNil)
 	}
-	// create table t1 with defaultBatchCnt+10 records.
+	// create table t1 with 1034 records.
 	tblInfo2 := testTableInfo(c, d, "t1", 3)
 	tJob2 := testCreateTable(c, ctx, d, dbInfo, tblInfo2)
 	testCheckTableState(c, d, dbInfo, tblInfo2, model.StatePublic)
 	testCheckJobDone(c, d, tJob2, true)
 	tbl2 := testGetTable(c, d, dbInfo.ID, tblInfo2.ID)
-	for i := 1; i <= defaultBatchCnt+10; i++ {
+	for i := 1; i <= 1034; i++ {
 		_, err := tbl2.AddRecord(ctx, types.MakeDatums(i, i, i))
 		c.Assert(err, IsNil)
 	}
-	tc := &testDDLCallback{}
-	var checkErr error
-	var updatedCount int
-	tc.onBgJobUpdated = func(job *model.Job) {
-		if job == nil || checkErr != nil {
-			return
-		}
-		job.Mu.Lock()
-		count := job.RowCount
-		job.Mu.Unlock()
-		if updatedCount == 0 && count != defaultBatchCnt+100 {
-			checkErr = errors.Errorf("row count %v isn't equal to %v", count, defaultBatchCnt+100)
-			return
-		}
-		if updatedCount == 1 && count != defaultBatchCnt+110 {
-			checkErr = errors.Errorf("row count %v isn't equal to %v", count, defaultBatchCnt+110)
-		}
-		updatedCount++
-	}
-	d.setHook(tc)
 	job, v := testDropSchema(c, ctx, d, dbInfo)
 	testCheckSchemaState(c, d, dbInfo, model.StateNone)
 	ids := make(map[int64]struct{})
 	ids[tblInfo1.ID] = struct{}{}
 	ids[tblInfo2.ID] = struct{}{}
 	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, db: dbInfo, tblIDs: ids})
-	// check background ddl info
-	verifyBgJobState(c, d, job, model.JobDone, testLease*350)
-	c.Assert(errors.ErrorStack(checkErr), Equals, "")
-	c.Assert(updatedCount, Equals, 2)
 
 	// Drop a non-existent database.
 	job = &model.Job{
@@ -187,7 +170,7 @@ func (s *testSchemaSuite) TestSchema(c *C) {
 		BinlogInfo: &model.HistoryInfo{},
 	}
 	err := d.doDDLJob(ctx, job)
-	c.Assert(terror.ErrorEqual(err, infoschema.ErrDatabaseDropExists), IsTrue)
+	c.Assert(terror.ErrorEqual(err, infoschema.ErrDatabaseDropExists), IsTrue, Commentf("err %v", err))
 
 	// Drop a database without a table.
 	dbInfo1 := testSchemaInfo(c, d, "test1")
@@ -197,39 +180,34 @@ func (s *testSchemaSuite) TestSchema(c *C) {
 	job, _ = testDropSchema(c, ctx, d, dbInfo1)
 	testCheckSchemaState(c, d, dbInfo1, model.StateNone)
 	testCheckJobDone(c, d, job, false)
-	verifyBgJobState(c, d, job, model.JobDone, testLease*5)
 }
 
 func (s *testSchemaSuite) TestSchemaWaitJob(c *C) {
-	defer testleak.AfterTest(c)()
 	store := testCreateStore(c, "test_schema_wait")
 	defer store.Close()
 
-	d1 := newDDL(store, nil, nil, testLease)
+	d1 := testNewDDL(context.Background(), nil, store, nil, nil, testLease)
 	defer d1.Stop()
 
-	testCheckOwner(c, d1, true, ddlJobFlag)
+	testCheckOwner(c, d1, true)
 
-	d2 := newDDL(store, nil, nil, testLease*4)
+	d2 := testNewDDL(context.Background(), nil, store, nil, nil, testLease*4)
 	defer d2.Stop()
 	ctx := testNewContext(d2)
 
 	// d2 must not be owner.
-	testCheckOwner(c, d2, false, ddlJobFlag)
+	d2.ownerManager.RetireOwner()
 
 	dbInfo := testSchemaInfo(c, d2, "test")
 	testCreateSchema(c, ctx, d2, dbInfo)
 	testCheckSchemaState(c, d2, dbInfo, model.StatePublic)
 
 	// d2 must not be owner.
-	testCheckOwner(c, d2, false, ddlJobFlag)
+	c.Assert(d2.ownerManager.IsOwner(), IsFalse)
 
 	schemaID, err := d2.genGlobalID()
 	c.Assert(err, IsNil)
 	doDDLJobErr(c, schemaID, 0, model.ActionCreateSchema, []interface{}{dbInfo}, ctx, d2)
-
-	// d2 must not be owner.
-	testCheckOwner(c, d2, false, ddlJobFlag)
 }
 
 func testRunInterruptedJob(c *C, d *ddl, job *model.Job) {
@@ -248,7 +226,8 @@ LOOP:
 		select {
 		case <-ticker.C:
 			d.Stop()
-			d.start()
+			d.restartWorkers(context.Background())
+			time.Sleep(time.Millisecond * 20)
 		case err := <-done:
 			c.Assert(err, IsNil)
 			break LOOP
@@ -257,32 +236,29 @@ LOOP:
 }
 
 func (s *testSchemaSuite) TestSchemaResume(c *C) {
-	defer testleak.AfterTest(c)()
 	store := testCreateStore(c, "test_schema_resume")
 	defer store.Close()
 
-	d1 := newDDL(store, nil, nil, testLease)
+	d1 := testNewDDL(context.Background(), nil, store, nil, nil, testLease)
 	defer d1.Stop()
 
-	testCheckOwner(c, d1, true, ddlJobFlag)
+	testCheckOwner(c, d1, true)
 
 	dbInfo := testSchemaInfo(c, d1, "test")
-
 	job := &model.Job{
 		SchemaID:   dbInfo.ID,
 		Type:       model.ActionCreateSchema,
 		BinlogInfo: &model.HistoryInfo{},
 		Args:       []interface{}{dbInfo},
 	}
-
 	testRunInterruptedJob(c, d1, job)
 	testCheckSchemaState(c, d1, dbInfo, model.StatePublic)
+
 	job = &model.Job{
 		SchemaID:   dbInfo.ID,
 		Type:       model.ActionDropSchema,
 		BinlogInfo: &model.HistoryInfo{},
 	}
-
 	testRunInterruptedJob(c, d1, job)
 	testCheckSchemaState(c, d1, dbInfo, model.StateNone)
 }

@@ -14,23 +14,20 @@
 package infoschema_test
 
 import (
-	"fmt"
 	"sync"
 	"testing"
 
-	"github.com/juju/errors"
 	. "github.com/pingcap/check"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/perfschema"
-	"github.com/pingcap/tidb/store/localstore"
-	"github.com/pingcap/tidb/store/localstore/goleveldb"
+	"github.com/pingcap/tidb/store/mockstore"
+	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/testutil"
-	"github.com/pingcap/tidb/util/types"
 )
 
 func TestT(t *testing.T) {
@@ -45,13 +42,11 @@ type testSuite struct {
 
 func (*testSuite) TestT(c *C) {
 	defer testleak.AfterTest(c)()
-	driver := localstore.Driver{Driver: goleveldb.MemoryDriver{}}
-	store, err := driver.Open("memory")
+	store, err := mockstore.NewMockTikvStore()
 	c.Assert(err, IsNil)
 	defer store.Close()
 
-	handle, err := infoschema.NewHandle(store)
-	c.Assert(err, IsNil)
+	handle := infoschema.NewHandle(store)
 	dbName := model.NewCIStr("Test")
 	tbName := model.NewCIStr("T")
 	colName := model.NewCIStr("A")
@@ -124,7 +119,7 @@ func (*testSuite) TestT(c *C) {
 
 	schemaNames := is.AllSchemaNames()
 	c.Assert(schemaNames, HasLen, 3)
-	c.Assert(testutil.CompareUnorderedStringSlice(schemaNames, []string{infoschema.Name, perfschema.Name, "Test"}), IsTrue)
+	c.Assert(testutil.CompareUnorderedStringSlice(schemaNames, []string{infoschema.Name, "PERFORMANCE_SCHEMA", "Test"}), IsTrue)
 
 	schemas := is.AllSchemas()
 	c.Assert(schemas, HasLen, 3)
@@ -152,6 +147,7 @@ func (*testSuite) TestT(c *C) {
 
 	c.Assert(is.TableExists(dbName, tbName), IsTrue)
 	c.Assert(is.TableExists(dbName, noexist), IsFalse)
+	c.Assert(is.TableIsView(dbName, tbName), IsFalse)
 
 	tb, ok := is.TableByID(tbID)
 	c.Assert(ok, IsTrue)
@@ -169,7 +165,7 @@ func (*testSuite) TestT(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(tb, NotNil)
 
-	tb, err = is.TableByName(dbName, noexist)
+	_, err = is.TableByName(dbName, noexist)
 	c.Assert(err, NotNil)
 
 	tbs := is.SchemaTables(dbName)
@@ -182,28 +178,43 @@ func (*testSuite) TestT(c *C) {
 	tb, err = is.TableByName(model.NewCIStr("information_schema"), model.NewCIStr("partitions"))
 	c.Assert(err, IsNil)
 	c.Assert(tb, NotNil)
+
+	err = kv.RunInNewTxn(store, true, func(txn kv.Transaction) error {
+		meta.NewMeta(txn).CreateTableOrView(dbID, tblInfo)
+		return errors.Trace(err)
+	})
+	c.Assert(err, IsNil)
+	txn, err = store.Begin()
+	c.Assert(err, IsNil)
+	_, err = builder.ApplyDiff(meta.NewMeta(txn), &model.SchemaDiff{Type: model.ActionRenameTable, SchemaID: dbID, TableID: tbID, OldSchemaID: dbID})
+	c.Assert(err, IsNil)
+	txn.Rollback()
+	builder.Build()
+	is = handle.Get()
+	schema, ok = is.SchemaByID(dbID)
+	c.Assert(ok, IsTrue)
+	c.Assert(len(schema.Tables), Equals, 1)
 }
 
 func checkApplyCreateNonExistsSchemaDoesNotPanic(c *C, txn kv.Transaction, builder *infoschema.Builder) {
 	m := meta.NewMeta(txn)
-	err := builder.ApplyDiff(m, &model.SchemaDiff{Type: model.ActionCreateSchema, SchemaID: 999})
+	_, err := builder.ApplyDiff(m, &model.SchemaDiff{Type: model.ActionCreateSchema, SchemaID: 999})
 	c.Assert(infoschema.ErrDatabaseNotExists.Equal(err), IsTrue)
 }
 
 func checkApplyCreateNonExistsTableDoesNotPanic(c *C, txn kv.Transaction, builder *infoschema.Builder, dbID int64) {
 	m := meta.NewMeta(txn)
-	err := builder.ApplyDiff(m, &model.SchemaDiff{Type: model.ActionCreateTable, SchemaID: dbID, TableID: 999})
+	_, err := builder.ApplyDiff(m, &model.SchemaDiff{Type: model.ActionCreateTable, SchemaID: dbID, TableID: 999})
 	c.Assert(infoschema.ErrTableNotExists.Equal(err), IsTrue)
 }
 
-// Make sure it is safe to concurrently create handle on multiple stores.
+// TestConcurrent makes sure it is safe to concurrently create handle on multiple stores.
 func (testSuite) TestConcurrent(c *C) {
 	defer testleak.AfterTest(c)()
 	storeCount := 5
 	stores := make([]kv.Storage, storeCount)
 	for i := 0; i < storeCount; i++ {
-		driver := localstore.Driver{Driver: goleveldb.MemoryDriver{}}
-		store, err := driver.Open(fmt.Sprintf("memory_path_%d", i))
+		store, err := mockstore.NewMockTikvStore()
 		c.Assert(err, IsNil)
 		stores[i] = store
 	}
@@ -217,29 +228,26 @@ func (testSuite) TestConcurrent(c *C) {
 	for _, store := range stores {
 		go func(s kv.Storage) {
 			defer wg.Done()
-			_, err := infoschema.NewHandle(s)
-			c.Assert(err, IsNil)
+			_ = infoschema.NewHandle(s)
 		}(store)
 	}
 	wg.Wait()
 }
 
-// Make sure that all tables of infomation_schema could be found in infoschema handle.
+// TestInfoTables makes sure that all tables of information_schema could be found in infoschema handle.
 func (*testSuite) TestInfoTables(c *C) {
 	defer testleak.AfterTest(c)()
-	driver := localstore.Driver{Driver: goleveldb.MemoryDriver{}}
-	store, err := driver.Open("memory")
+	store, err := mockstore.NewMockTikvStore()
 	c.Assert(err, IsNil)
 	defer store.Close()
-	handle, err := infoschema.NewHandle(store)
-	c.Assert(err, IsNil)
+	handle := infoschema.NewHandle(store)
 	builder, err := infoschema.NewBuilder(handle).InitWithDBInfos(nil, 0)
 	c.Assert(err, IsNil)
 	builder.Build()
 	is := handle.Get()
 	c.Assert(is, NotNil)
 
-	info_tables := []string{
+	infoTables := []string{
 		"SCHEMATA",
 		"TABLES",
 		"COLUMNS",
@@ -255,8 +263,24 @@ func (*testSuite) TestInfoTables(c *C) {
 		"PLUGINS",
 		"TABLE_CONSTRAINTS",
 		"TRIGGERS",
+		"USER_PRIVILEGES",
+		"ENGINES",
+		"VIEWS",
+		"ROUTINES",
+		"SCHEMA_PRIVILEGES",
+		"COLUMN_PRIVILEGES",
+		"TABLE_PRIVILEGES",
+		"PARAMETERS",
+		"EVENTS",
+		"GLOBAL_STATUS",
+		"GLOBAL_VARIABLES",
+		"SESSION_STATUS",
+		"OPTIMIZER_TRACE",
+		"TABLESPACES",
+		"COLLATION_CHARACTER_SET_APPLICABILITY",
+		"PROCESSLIST",
 	}
-	for _, t := range info_tables {
+	for _, t := range infoTables {
 		tb, err1 := is.TableByName(model.NewCIStr(infoschema.Name), model.NewCIStr(t))
 		c.Assert(err1, IsNil)
 		c.Assert(tb, NotNil)

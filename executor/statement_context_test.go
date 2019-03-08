@@ -14,11 +14,14 @@
 package executor_test
 
 import (
+	"fmt"
+	"unicode/utf8"
+
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/util/testkit"
-	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pingcap/tidb/util/types"
 )
 
 const (
@@ -26,11 +29,7 @@ const (
 	nonStrictModeSQL = "set sql_mode = ''"
 )
 
-func (s *testSuite) TestStatementContext(c *C) {
-	defer func() {
-		s.cleanEnv(c)
-		testleak.AfterTest(c)
-	}()
+func (s *testSuite1) TestStatementContext(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
 	tk.MustExec("create table sc (a int)")
@@ -38,9 +37,7 @@ func (s *testSuite) TestStatementContext(c *C) {
 
 	tk.MustExec(strictModeSQL)
 	tk.MustQuery("select * from sc where a > cast(1.1 as decimal)").Check(testkit.Rows("2"))
-	_, err := tk.Exec(`select * from sc where a > cast(1.1 as decimal); 
-		        update sc set a = 4 where a > cast(1.1 as decimal)`)
-	c.Check(terror.ErrorEqual(err, types.ErrTruncated), IsTrue)
+	tk.MustExec("update sc set a = 4 where a > cast(1.1 as decimal)")
 
 	tk.MustExec(nonStrictModeSQL)
 	tk.MustExec("update sc set a = 3 where a > cast(1.1 as decimal)")
@@ -54,7 +51,7 @@ func (s *testSuite) TestStatementContext(c *C) {
 	// Handle coprocessor flags, '1x' is an invalid int.
 	// UPDATE and DELETE do select request first which is handled by coprocessor.
 	// In strict mode we expect error.
-	_, err = tk.Exec("update sc set a = 4 where a > '1x'")
+	_, err := tk.Exec("update sc set a = 4 where a > '1x'")
 	c.Assert(err, NotNil)
 	_, err = tk.Exec("delete from sc where a < '1x'")
 	c.Assert(err, NotNil)
@@ -65,4 +62,49 @@ func (s *testSuite) TestStatementContext(c *C) {
 	tk.MustExec("update sc set a = 4 where a > '1x'")
 	tk.MustExec("delete from sc where a < '1x'")
 	tk.MustQuery("select * from sc where a > '1x'").Check(testkit.Rows("4"))
+
+	// Test invalid UTF8
+	tk.MustExec("create table sc2 (a varchar(255))")
+	// Insert an invalid UTF8
+	tk.MustExec("insert sc2 values (unhex('4040ffff'))")
+	c.Assert(tk.Se.GetSessionVars().StmtCtx.WarningCount(), Greater, uint16(0))
+	tk.MustQuery("select * from sc2").Check(testkit.Rows("@@"))
+	tk.MustExec(strictModeSQL)
+	_, err = tk.Exec("insert sc2 values (unhex('4040ffff'))")
+	c.Assert(err, NotNil)
+	c.Assert(terror.ErrorEqual(err, table.ErrTruncateWrongValue), IsTrue, Commentf("err %v", err))
+
+	tk.MustExec("set @@tidb_skip_utf8_check = '1'")
+	_, err = tk.Exec("insert sc2 values (unhex('4040ffff'))")
+	c.Assert(err, IsNil)
+	tk.MustQuery("select length(a) from sc2").Check(testkit.Rows("2", "4"))
+
+	tk.MustExec("set @@tidb_skip_utf8_check = '0'")
+	runeErrStr := string(utf8.RuneError)
+	tk.MustExec(fmt.Sprintf("insert sc2 values ('%s')", runeErrStr))
+
+	// Test non-BMP characters.
+	tk.MustExec(nonStrictModeSQL)
+	tk.MustExec("drop table if exists t1")
+	tk.MustExec("create table t1(a varchar(100) charset utf8);")
+	defer tk.MustExec("drop table if exists t1")
+	tk.MustExec("insert t1 values (unhex('f09f8c80'))")
+	c.Assert(tk.Se.GetSessionVars().StmtCtx.WarningCount(), Greater, uint16(0))
+	tk.MustQuery("select * from t1").Check(testkit.Rows(""))
+	tk.MustExec("insert t1 values (unhex('4040f09f8c80'))")
+	c.Assert(tk.Se.GetSessionVars().StmtCtx.WarningCount(), Greater, uint16(0))
+	tk.MustQuery("select * from t1").Check(testkit.Rows("", "@@"))
+	tk.MustQuery("select length(a) from t1").Check(testkit.Rows("0", "2"))
+	tk.MustExec(strictModeSQL)
+	_, err = tk.Exec("insert t1 values (unhex('f09f8c80'))")
+	c.Assert(err, NotNil)
+	c.Assert(terror.ErrorEqual(err, table.ErrTruncateWrongValue), IsTrue, Commentf("err %v", err))
+	_, err = tk.Exec("insert t1 values (unhex('F0A48BAE'))")
+	c.Assert(err, NotNil)
+	c.Assert(terror.ErrorEqual(err, table.ErrTruncateWrongValue), IsTrue, Commentf("err %v", err))
+	config.GetGlobalConfig().CheckMb4ValueInUtf8 = false
+	tk.MustExec("insert t1 values (unhex('f09f8c80'))")
+	config.GetGlobalConfig().CheckMb4ValueInUtf8 = true
+	_, err = tk.Exec("insert t1 values (unhex('F0A48BAE'))")
+	c.Assert(err, NotNil)
 }

@@ -14,19 +14,21 @@
 package ddl
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 
-	"github.com/juju/errors"
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/context"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/util/testleak"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/types"
 )
 
 var _ = Suite(&testTableSuite{})
@@ -38,7 +40,7 @@ type testTableSuite struct {
 	d *ddl
 }
 
-// create a test table with num int columns and with no index.
+// testTableInfo creates a test table with num int columns and with no index.
 func testTableInfo(c *C, d *ddl, name string, num int) *model.TableInfo {
 	var err error
 	tblInfo := &model.TableInfo{
@@ -66,7 +68,44 @@ func testTableInfo(c *C, d *ddl, name string, num int) *model.TableInfo {
 	return tblInfo
 }
 
-func testCreateTable(c *C, ctx context.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo) *model.Job {
+// testViewInfo creates a test view with num int columns.
+func testViewInfo(c *C, d *ddl, name string, num int) *model.TableInfo {
+	var err error
+	tblInfo := &model.TableInfo{
+		Name: model.NewCIStr(name),
+	}
+	tblInfo.ID, err = d.genGlobalID()
+	c.Assert(err, IsNil)
+
+	cols := make([]*model.ColumnInfo, num)
+	viewCols := make([]model.CIStr, num)
+
+	var stmtBuffer bytes.Buffer
+	stmtBuffer.WriteString("SELECT ")
+	for i := range cols {
+		col := &model.ColumnInfo{
+			Name:   model.NewCIStr(fmt.Sprintf("c%d", i+1)),
+			Offset: i,
+			State:  model.StatePublic,
+		}
+
+		col.ID = allocateColumnID(tblInfo)
+		cols[i] = col
+		viewCols[i] = col.Name
+		stmtBuffer.WriteString(cols[i].Name.L + ",")
+	}
+	stmtBuffer.WriteString("1 FROM t")
+
+	view := model.ViewInfo{Cols: viewCols, Security: model.SecurityDefiner, Algorithm: model.AlgorithmMerge,
+		SelectStmt: stmtBuffer.String(), CheckOption: model.CheckOptionCascaded, Definer: &auth.UserIdentity{CurrentUser: true}}
+
+	tblInfo.View = &view
+	tblInfo.Columns = cols
+
+	return tblInfo
+}
+
+func testCreateTable(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo) *model.Job {
 	job := &model.Job{
 		SchemaID:   dbInfo.ID,
 		TableID:    tblInfo.ID,
@@ -84,7 +123,27 @@ func testCreateTable(c *C, ctx context.Context, d *ddl, dbInfo *model.DBInfo, tb
 	return job
 }
 
-func testRenameTable(c *C, ctx context.Context, d *ddl, newSchemaID, oldSchemaID int64, tblInfo *model.TableInfo) *model.Job {
+func testCreateView(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo) *model.Job {
+	job := &model.Job{
+		SchemaID:   dbInfo.ID,
+		TableID:    tblInfo.ID,
+		Type:       model.ActionCreateView,
+		BinlogInfo: &model.HistoryInfo{},
+		Args:       []interface{}{tblInfo, false, 0},
+	}
+
+	c.Assert(tblInfo.IsView(), IsTrue)
+	err := d.doDDLJob(ctx, job)
+	c.Assert(err, IsNil)
+
+	v := getSchemaVer(c, ctx)
+	tblInfo.State = model.StatePublic
+	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, tbl: tblInfo})
+	tblInfo.State = model.StateNone
+	return job
+}
+
+func testRenameTable(c *C, ctx sessionctx.Context, d *ddl, newSchemaID, oldSchemaID int64, tblInfo *model.TableInfo) *model.Job {
 	job := &model.Job{
 		SchemaID:   newSchemaID,
 		TableID:    tblInfo.ID,
@@ -102,7 +161,7 @@ func testRenameTable(c *C, ctx context.Context, d *ddl, newSchemaID, oldSchemaID
 	return job
 }
 
-func testDropTable(c *C, ctx context.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo) *model.Job {
+func testDropTable(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo) *model.Job {
 	job := &model.Job{
 		SchemaID:   dbInfo.ID,
 		TableID:    tblInfo.ID,
@@ -117,7 +176,7 @@ func testDropTable(c *C, ctx context.Context, d *ddl, dbInfo *model.DBInfo, tblI
 	return job
 }
 
-func testTruncateTable(c *C, ctx context.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo) *model.Job {
+func testTruncateTable(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo) *model.Job {
 	newTableID, err := d.genGlobalID()
 	c.Assert(err, IsNil)
 	job := &model.Job{
@@ -176,7 +235,7 @@ func testGetTableWithError(d *ddl, schemaID, tableID int64) (table.Table, error)
 	if tblInfo == nil {
 		return nil, errors.New("table not found")
 	}
-	alloc := autoid.NewAllocator(d.store, schemaID)
+	alloc := autoid.NewAllocator(d.store, schemaID, false)
 	tbl, err := table.TableFromMeta(alloc, tblInfo)
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -186,25 +245,19 @@ func testGetTableWithError(d *ddl, schemaID, tableID int64) (table.Table, error)
 
 func (s *testTableSuite) SetUpSuite(c *C) {
 	s.store = testCreateStore(c, "test_table")
-	s.d = newDDL(s.store, nil, nil, testLease)
+	s.d = testNewDDL(context.Background(), nil, s.store, nil, nil, testLease)
 
 	s.dbInfo = testSchemaInfo(c, s.d, "test")
 	testCreateSchema(c, testNewContext(s.d), s.d, s.dbInfo)
-
-	// Use a smaller limit to prevent the test from consuming too much time.
-	reorgTableDeleteLimit = 2000
 }
 
 func (s *testTableSuite) TearDownSuite(c *C) {
 	testDropSchema(c, testNewContext(s.d), s.d, s.dbInfo)
 	s.d.Stop()
 	s.store.Close()
-
-	reorgTableDeleteLimit = 65536
 }
 
 func (s *testTableSuite) TestTable(c *C) {
-	defer testleak.AfterTest(c)()
 	d := s.d
 
 	ctx := testNewContext(d)
@@ -218,40 +271,15 @@ func (s *testTableSuite) TestTable(c *C) {
 	newTblInfo := testTableInfo(c, d, "t", 3)
 	doDDLJobErr(c, s.dbInfo.ID, newTblInfo.ID, model.ActionCreateTable, []interface{}{newTblInfo}, ctx, d)
 
-	// To drop a table with reorgTableDeleteLimit+10 records.
+	count := 2000
 	tbl := testGetTable(c, d, s.dbInfo.ID, tblInfo.ID)
-	for i := 1; i <= reorgTableDeleteLimit+10; i++ {
+	for i := 1; i <= count; i++ {
 		_, err := tbl.AddRecord(ctx, types.MakeDatums(i, i, i))
 		c.Assert(err, IsNil)
 	}
 
-	tc := &testDDLCallback{}
-	var checkErr error
-	var updatedCount int
-	tc.onBgJobUpdated = func(job *model.Job) {
-		if job == nil || checkErr != nil {
-			return
-		}
-		job.Mu.Lock()
-		count := job.RowCount
-		job.Mu.Unlock()
-		if updatedCount == 0 && count != int64(reorgTableDeleteLimit) {
-			checkErr = errors.Errorf("row count %v isn't equal to %v", count, reorgTableDeleteLimit)
-			return
-		}
-		if updatedCount == 1 && count != int64(reorgTableDeleteLimit+10) {
-			checkErr = errors.Errorf("row count %v isn't equal to %v", count, reorgTableDeleteLimit+10)
-		}
-		updatedCount++
-	}
-	d.setHook(tc)
 	job = testDropTable(c, ctx, d, s.dbInfo, tblInfo)
 	testCheckJobDone(c, d, job, false)
-
-	// Check background ddl info.
-	verifyBgJobState(c, d, job, model.JobDone, testLease*350)
-	c.Assert(errors.ErrorStack(checkErr), Equals, "")
-	c.Assert(updatedCount, Equals, 2)
 
 	// for truncate table
 	tblInfo = testTableInfo(c, d, "tt", 3)
@@ -260,7 +288,7 @@ func (s *testTableSuite) TestTable(c *C) {
 	testCheckJobDone(c, d, job, true)
 	job = testTruncateTable(c, ctx, d, s.dbInfo, tblInfo)
 	testCheckTableState(c, d, s.dbInfo, tblInfo, model.StatePublic)
-	testCheckJobDone(c, d, job, false)
+	testCheckJobDone(c, d, job, true)
 
 	// for rename table
 	dbInfo1 := testSchemaInfo(c, s.d, "test_rename_table")
@@ -271,10 +299,9 @@ func (s *testTableSuite) TestTable(c *C) {
 }
 
 func (s *testTableSuite) TestTableResume(c *C) {
-	defer testleak.AfterTest(c)()
 	d := s.d
 
-	testCheckOwner(c, d, true, ddlJobFlag)
+	testCheckOwner(c, d, true)
 
 	tblInfo := testTableInfo(c, d, "t1", 3)
 	job := &model.Job{

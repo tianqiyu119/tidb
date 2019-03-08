@@ -14,7 +14,10 @@
 package kv
 
 import (
-	"github.com/juju/errors"
+	"context"
+
+	"github.com/pingcap/errors"
+	"github.com/pingcap/tidb/store/tikv/oracle"
 )
 
 // mockTxn is a txn that returns a retryAble error when called Commit.
@@ -23,8 +26,8 @@ type mockTxn struct {
 	valid bool
 }
 
-// Always returns a retryable error.
-func (t *mockTxn) Commit() error {
+// Commit always returns a retryable error.
+func (t *mockTxn) Commit(ctx context.Context) error {
 	return ErrRetryable
 }
 
@@ -43,12 +46,10 @@ func (t *mockTxn) LockKeys(keys ...Key) error {
 
 func (t *mockTxn) SetOption(opt Option, val interface{}) {
 	t.opts[opt] = val
-	return
 }
 
 func (t *mockTxn) DelOption(opt Option) {
 	delete(t.opts, opt)
-	return
 }
 
 func (t *mockTxn) GetOption(opt Option) interface{} {
@@ -66,11 +67,15 @@ func (t *mockTxn) Get(k Key) ([]byte, error) {
 	return nil, nil
 }
 
-func (t *mockTxn) Seek(k Key) (Iterator, error) {
+func (t *mockTxn) BatchGet(keys []Key) (map[string][]byte, error) {
 	return nil, nil
 }
 
-func (t *mockTxn) SeekReverse(k Key) (Iterator, error) {
+func (t *mockTxn) Iter(k Key, upperBound Key) (Iterator, error) {
+	return nil, nil
+}
+
+func (t *mockTxn) IterReverse(k Key) (Iterator, error) {
 	return nil, nil
 }
 
@@ -93,6 +98,30 @@ func (t *mockTxn) Size() int {
 	return 0
 }
 
+func (t *mockTxn) GetMemBuffer() MemBuffer {
+	return nil
+}
+
+func (t *mockTxn) SetCap(cap int) {
+
+}
+
+func (t *mockTxn) Reset() {
+	t.valid = false
+}
+
+func (t *mockTxn) SetVars(vars *Variables) {
+
+}
+
+// NewMockTxn new a mockTxn.
+func NewMockTxn() Transaction {
+	return &mockTxn{
+		opts:  make(map[Option]interface{}),
+		valid: true,
+	}
+}
+
 // mockStorage is used to start a must commit-failed txn.
 type mockStorage struct {
 }
@@ -112,7 +141,7 @@ func (s *mockStorage) BeginWithStartTS(startTS uint64) (Transaction, error) {
 
 func (s *mockStorage) GetSnapshot(ver Version) (Snapshot, error) {
 	return &mockSnapshot{
-		store: NewMemDbBuffer(),
+		store: NewMemDbBuffer(DefaultTxnMembufCap),
 	}, nil
 }
 
@@ -131,6 +160,14 @@ func (s *mockStorage) CurrentVersion() (Version, error) {
 
 func (s *mockStorage) GetClient() Client {
 	return nil
+}
+
+func (s *mockStorage) GetOracle() oracle.Oracle {
+	return nil
+}
+
+func (s *mockStorage) SupportDeleteRange() (supported bool) {
+	return false
 }
 
 // MockTxn is used for test cases that need more interfaces than Transaction.
@@ -152,6 +189,10 @@ func (s *mockSnapshot) Get(k Key) ([]byte, error) {
 	return s.store.Get(k)
 }
 
+func (s *mockSnapshot) SetPriority(priority int) {
+
+}
+
 func (s *mockSnapshot) BatchGet(keys []Key) (map[string][]byte, error) {
 	m := make(map[string][]byte)
 	for _, k := range keys {
@@ -167,10 +208,10 @@ func (s *mockSnapshot) BatchGet(keys []Key) (map[string][]byte, error) {
 	return m, nil
 }
 
-func (s *mockSnapshot) Seek(k Key) (Iterator, error) {
-	return s.store.Seek(k)
+func (s *mockSnapshot) Iter(k Key, upperBound Key) (Iterator, error) {
+	return s.store.Iter(k, upperBound)
 }
 
-func (s *mockSnapshot) SeekReverse(k Key) (Iterator, error) {
-	return s.store.SeekReverse(k)
+func (s *mockSnapshot) IterReverse(k Key) (Iterator, error) {
+	return s.store.IterReverse(k)
 }

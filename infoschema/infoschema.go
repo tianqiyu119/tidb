@@ -17,14 +17,12 @@ import (
 	"sort"
 	"sync/atomic"
 
-	"github.com/juju/errors"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/perfschema"
 	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/terror"
 )
 
 var (
@@ -52,8 +50,14 @@ var (
 	ErrColumnExists = terror.ClassSchema.New(codeColumnExists, "Duplicate column name '%s'")
 	// ErrIndexExists returns for index already exists.
 	ErrIndexExists = terror.ClassSchema.New(codeIndexExists, "Duplicate Index")
+	// ErrKeyNameDuplicate returns for index duplicate when rename index.
+	ErrKeyNameDuplicate = terror.ClassSchema.New(codeKeyNameDuplicate, "Duplicate key name '%s'")
+	// ErrKeyNotExists returns for index not exists.
+	ErrKeyNotExists = terror.ClassSchema.New(codeKeyNotExists, "Key '%s' doesn't exist in table '%s'")
 	// ErrMultiplePriKey returns for multiple primary keys.
 	ErrMultiplePriKey = terror.ClassSchema.New(codeMultiplePriKey, "Multiple primary key defined")
+	// ErrTooManyKeyParts returns for too many key parts.
+	ErrTooManyKeyParts = terror.ClassSchema.New(codeTooManyKeyParts, "Too many key parts specified; max %d parts allowed")
 )
 
 // InfoSchema is the interface used to retrieve the schema information.
@@ -66,6 +70,7 @@ type InfoSchema interface {
 	TableByName(schema, table model.CIStr) (table.Table, error)
 	TableExists(schema, table model.CIStr) bool
 	SchemaByID(id int64) (*model.DBInfo, bool)
+	SchemaByTable(tableInfo *model.TableInfo) (*model.DBInfo, bool)
 	TableByID(id int64) (table.Table, bool)
 	AllocByID(id int64) (autoid.Allocator, bool)
 	AllSchemaNames() []string
@@ -73,6 +78,8 @@ type InfoSchema interface {
 	Clone() (result []*model.DBInfo)
 	SchemaTables(schema model.CIStr) []table.Table
 	SchemaMetaVersion() int64
+	// TableIsView indicates whether the schema.table is a view.
+	TableIsView(schema, table model.CIStr) bool
 }
 
 // Information Schema Name.
@@ -117,7 +124,7 @@ type infoSchema struct {
 	// sortedTablesBuckets is a slice of sortedTables, a table's bucket index is (tableID % bucketCount).
 	sortedTablesBuckets []sortedTables
 
-	// We should check version when change schema.
+	// schemaMetaVersion is the version of schema, and we should check version when change schema.
 	schemaMetaVersion int64
 }
 
@@ -169,7 +176,16 @@ func (is *infoSchema) TableByName(schema, table model.CIStr) (t table.Table, err
 			return
 		}
 	}
-	return nil, ErrTableNotExists.GenByArgs(schema, table)
+	return nil, ErrTableNotExists.GenWithStackByArgs(schema, table)
+}
+
+func (is *infoSchema) TableIsView(schema, table model.CIStr) bool {
+	if tbNames, ok := is.schemaMap[schema.L]; ok {
+		if t, ok := tbNames.tables[table.L]; ok {
+			return t.Meta().IsView()
+		}
+	}
+	return false
 }
 
 func (is *infoSchema) TableExists(schema, table model.CIStr) bool {
@@ -190,6 +206,20 @@ func (is *infoSchema) SchemaByID(id int64) (val *model.DBInfo, ok bool) {
 	return nil, false
 }
 
+func (is *infoSchema) SchemaByTable(tableInfo *model.TableInfo) (val *model.DBInfo, ok bool) {
+	if tableInfo == nil {
+		return nil, false
+	}
+	for _, v := range is.schemaMap {
+		if tbl, ok := v.tables[tableInfo.Name.L]; ok {
+			if tbl.Meta().ID == tableInfo.ID {
+				return v.dbInfo, true
+			}
+		}
+	}
+	return nil, false
+}
+
 func (is *infoSchema) TableByID(id int64) (val table.Table, ok bool) {
 	slice := is.sortedTablesBuckets[tableBucketIdx(id)]
 	idx := slice.searchTable(id)
@@ -204,7 +234,7 @@ func (is *infoSchema) AllocByID(id int64) (autoid.Allocator, bool) {
 	if !ok {
 		return nil, false
 	}
-	return tbl.Allocator(), true
+	return tbl.Allocator(nil), true
 }
 
 func (is *infoSchema) AllSchemaNames() (names []string) {
@@ -241,26 +271,16 @@ func (is *infoSchema) Clone() (result []*model.DBInfo) {
 
 // Handle handles information schema, including getting and setting.
 type Handle struct {
-	value      atomic.Value
-	store      kv.Storage
-	perfHandle perfschema.PerfSchema
+	value atomic.Value
+	store kv.Storage
 }
 
 // NewHandle creates a new Handle.
-func NewHandle(store kv.Storage) (*Handle, error) {
+func NewHandle(store kv.Storage) *Handle {
 	h := &Handle{
 		store: store,
 	}
-	// init memory tables
-	var err error
-	h.perfHandle, err = perfschema.NewPerfHandle()
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return h, nil
+	return h
 }
 
 // Get gets information schema from Handle.
@@ -270,16 +290,10 @@ func (h *Handle) Get() InfoSchema {
 	return schema
 }
 
-// GetPerfHandle gets performance schema from handle.
-func (h *Handle) GetPerfHandle() perfschema.PerfSchema {
-	return h.perfHandle
-}
-
 // EmptyClone creates a new Handle with the same store and memSchema, but the value is not set.
 func (h *Handle) EmptyClone() *Handle {
 	newHandle := &Handle{
-		store:      h.store,
-		perfHandle: h.perfHandle,
+		store: h.store,
 	}
 	return newHandle
 }
@@ -295,12 +309,15 @@ const (
 	codeForeignKeyNotExists = 1091
 	codeWrongFkDef          = 1239
 
-	codeDatabaseExists = 1007
-	codeTableExists    = 1050
-	codeBadTable       = 1051
-	codeColumnExists   = 1060
-	codeIndexExists    = 1831
-	codeMultiplePriKey = 1068
+	codeDatabaseExists   = 1007
+	codeTableExists      = 1050
+	codeBadTable         = 1051
+	codeColumnExists     = 1060
+	codeIndexExists      = 1831
+	codeMultiplePriKey   = 1068
+	codeTooManyKeyParts  = 1070
+	codeKeyNameDuplicate = 1061
+	codeKeyNotExists     = 1176
 )
 
 func init() {
@@ -318,6 +335,9 @@ func init() {
 		codeColumnExists:        mysql.ErrDupFieldName,
 		codeIndexExists:         mysql.ErrDupIndex,
 		codeMultiplePriKey:      mysql.ErrMultiplePriKey,
+		codeTooManyKeyParts:     mysql.ErrTooManyKeyParts,
+		codeKeyNameDuplicate:    mysql.ErrDupKeyName,
+		codeKeyNotExists:        mysql.ErrKeyDoesNotExist,
 	}
 	terror.ErrClassToMySQLCodes[terror.ClassSchema] = schemaMySQLErrCodes
 	initInfoSchemaDB()
@@ -349,5 +369,13 @@ func initInfoSchemaDB() {
 
 // IsMemoryDB checks if the db is in memory.
 func IsMemoryDB(dbName string) bool {
-	return dbName == "information_schema" || dbName == "performance_schema"
+	if dbName == "information_schema" {
+		return true
+	}
+	for _, driver := range drivers {
+		if driver.DBInfo.Name.L == dbName {
+			return true
+		}
+	}
+	return false
 }

@@ -14,16 +14,17 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/expression"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/infoschema"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/sqlexec"
 )
 
@@ -37,49 +38,43 @@ var (
 
 // RevokeExec executes RevokeStmt.
 type RevokeExec struct {
+	baseExecutor
+
 	Privs      []*ast.PrivElem
 	ObjectType ast.ObjectTypeType
 	Level      *ast.GrantLevel
 	Users      []*ast.UserSpec
 
-	ctx  context.Context
+	ctx  sessionctx.Context
 	is   infoschema.InfoSchema
 	done bool
 }
 
-// Schema implements the Executor Schema interface.
-func (e *RevokeExec) Schema() *expression.Schema {
-	return expression.NewSchema()
-}
-
-// Next implements Execution Next interface.
-func (e *RevokeExec) Next() (*Row, error) {
+// Next implements the Executor Next interface.
+func (e *RevokeExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
 	if e.done {
-		return nil, nil
-	}
-
-	// Revoke for each user
-	for _, user := range e.Users {
-		// Check if user exists.
-		userName, host := parseUser(user.User)
-		exists, err := userExists(e.ctx, userName, host)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		if !exists {
-			return nil, errors.Errorf("Unknown user: %s", user.User)
-		}
-
-		err = e.revokeOneUser(userName, host)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
+		return nil
 	}
 	e.done = true
-	// Flush privileges.
-	dom := sessionctx.GetDomain(e.ctx)
-	err := dom.PrivilegeHandle().Update()
-	return nil, errors.Trace(err)
+
+	// Revoke for each user.
+	for _, user := range e.Users {
+		// Check if user exists.
+		exists, err := userExists(e.ctx, user.User.Username, user.User.Hostname)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		if !exists {
+			return errors.Errorf("Unknown user: %s", user.User)
+		}
+
+		err = e.revokeOneUser(user.User.Username, user.User.Hostname)
+		if err != nil {
+			return errors.Trace(err)
+		}
+	}
+	domain.GetDomain(e.ctx).NotifyUpdatePrivilege(e.ctx)
+	return nil
 }
 
 func (e *RevokeExec) revokeOneUser(user, host string) error {
@@ -140,7 +135,7 @@ func (e *RevokeExec) revokeGlobalPriv(priv *ast.PrivElem, user, host string) err
 	if err != nil {
 		return errors.Trace(err)
 	}
-	sql := fmt.Sprintf(`UPDATE %s.%s SET %s WHERE User="%s" AND Host="%s"`, mysql.SystemDB, mysql.UserTable, asgns, user, host)
+	sql := fmt.Sprintf(`UPDATE %s.%s SET %s WHERE User='%s' AND Host='%s'`, mysql.SystemDB, mysql.UserTable, asgns, user, host)
 	_, _, err = e.ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(e.ctx, sql)
 	return errors.Trace(err)
 }
@@ -154,7 +149,7 @@ func (e *RevokeExec) revokeDBPriv(priv *ast.PrivElem, userName, host string) err
 	if err != nil {
 		return errors.Trace(err)
 	}
-	sql := fmt.Sprintf(`UPDATE %s.%s SET %s WHERE User="%s" AND Host="%s" AND DB="%s";`, mysql.SystemDB, mysql.DBTable, asgns, userName, host, dbName)
+	sql := fmt.Sprintf(`UPDATE %s.%s SET %s WHERE User='%s' AND Host='%s' AND DB='%s';`, mysql.SystemDB, mysql.DBTable, asgns, userName, host, dbName)
 	_, _, err = e.ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(e.ctx, sql)
 	return errors.Trace(err)
 }
@@ -168,7 +163,7 @@ func (e *RevokeExec) revokeTablePriv(priv *ast.PrivElem, user, host string) erro
 	if err != nil {
 		return errors.Trace(err)
 	}
-	sql := fmt.Sprintf(`UPDATE %s.%s SET %s WHERE User="%s" AND Host="%s" AND DB="%s" AND Table_name="%s";`, mysql.SystemDB, mysql.TablePrivTable, asgns, user, host, dbName, tbl.Meta().Name.O)
+	sql := fmt.Sprintf(`UPDATE %s.%s SET %s WHERE User='%s' AND Host='%s' AND DB='%s' AND Table_name='%s';`, mysql.SystemDB, mysql.TablePrivTable, asgns, user, host, dbName, tbl.Meta().Name.O)
 	_, _, err = e.ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(e.ctx, sql)
 	return errors.Trace(err)
 }
@@ -187,16 +182,11 @@ func (e *RevokeExec) revokeColumnPriv(priv *ast.PrivElem, user, host string) err
 		if err != nil {
 			return errors.Trace(err)
 		}
-		sql := fmt.Sprintf(`UPDATE %s.%s SET %s WHERE User="%s" AND Host="%s" AND DB="%s" AND Table_name="%s" AND Column_name="%s";`, mysql.SystemDB, mysql.ColumnPrivTable, asgns, user, host, dbName, tbl.Meta().Name.O, col.Name.O)
+		sql := fmt.Sprintf(`UPDATE %s.%s SET %s WHERE User='%s' AND Host='%s' AND DB='%s' AND Table_name='%s' AND Column_name='%s';`, mysql.SystemDB, mysql.ColumnPrivTable, asgns, user, host, dbName, tbl.Meta().Name.O, col.Name.O)
 		_, _, err = e.ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(e.ctx, sql)
 		if err != nil {
 			return errors.Trace(err)
 		}
 	}
-	return nil
-}
-
-// Close implements the Executor Close interface.
-func (e *RevokeExec) Close() error {
 	return nil
 }
